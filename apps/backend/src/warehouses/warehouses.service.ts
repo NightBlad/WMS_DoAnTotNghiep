@@ -1,0 +1,215 @@
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { Warehouse } from '../entities/warehouse.entity';
+import { CreateWarehouseDto } from './dto/create-warehouse.dto';
+import { UpdateWarehouseDto } from './dto/update-warehouse.dto';
+import { AuditLogService } from '../audit-log/audit-log.service';
+
+@Injectable()
+export class WarehousesService {
+  constructor(
+    @InjectRepository(Warehouse) private repo: Repository<Warehouse>,
+    private readonly auditLogService: AuditLogService,
+  ) {}
+
+  private parseWarehouse(warehouse: Warehouse) {
+    let parsedSubWarehouses = [];
+    if (warehouse.subWarehouses) {
+      if (Array.isArray(warehouse.subWarehouses)) {
+        parsedSubWarehouses = warehouse.subWarehouses;
+      } else if (typeof warehouse.subWarehouses === 'string' && (warehouse.subWarehouses as string).trim()) {
+        try {
+          parsedSubWarehouses = JSON.parse(warehouse.subWarehouses);
+        } catch {
+          parsedSubWarehouses = [];
+        }
+      }
+    }
+
+    return {
+      ...warehouse,
+      managerIds: this.parseJsonArray(warehouse.managerIds),
+      staffIds: this.parseJsonArray(warehouse.staffIds),
+      subWarehouses: parsedSubWarehouses,
+    };
+  }
+
+  private parseJsonArray(value: any): string[] {
+    try {
+      if (!value) return [];
+      if (Array.isArray(value)) return value.map(String);
+      if (typeof value === 'string') {
+        try {
+          const parsed = JSON.parse(value);
+          if (Array.isArray(parsed)) return parsed.map(String);
+        } catch {
+          // not json
+        }
+        return value.split(',').map(s => s.trim()).filter(Boolean);
+      }
+      return [];
+    } catch (e) {
+      console.error('Error parsing JSON array:', e);
+      return [];
+    }
+  }
+
+  /** Internal: returns raw Warehouse entity for TypeORM operations */
+  private async findOneEntity(id: string): Promise<Warehouse> {
+    const warehouse = await this.repo.findOne({ where: { id } });
+    if (!warehouse) {
+      throw new NotFoundException(`Warehouse with ID ${id} not found`);
+    }
+    return warehouse;
+  }
+
+  async findAll() {
+    const warehouses = await this.repo.find({
+      order: { createdAt: 'DESC' },
+    });
+    return warehouses.map((w) => this.parseWarehouse(w));
+  }
+
+  async findOne(id: string) {
+    const warehouse = await this.findOneEntity(id);
+    return this.parseWarehouse(warehouse);
+  }
+
+  async findByCode(code: string): Promise<Warehouse | null> {
+    return this.repo.findOne({ where: { code } });
+  }
+
+  async isWarehouseFrozen(codeOrId: string): Promise<boolean> {
+    if (!codeOrId) return false;
+    const warehouse = await this.repo.findOne({
+      where: [{ id: codeOrId }, { code: codeOrId }],
+    });
+    return warehouse ? Boolean(warehouse.isFrozen) : false;
+  }
+
+  async freezeWarehouse(id: string) {
+    const warehouse = await this.findOneEntity(id);
+    warehouse.isFrozen = true;
+    await this.repo.save(warehouse);
+    return this.parseWarehouse(warehouse);
+  }
+
+  async unfreezeWarehouse(id: string) {
+    const warehouse = await this.findOneEntity(id);
+    warehouse.isFrozen = false;
+    await this.repo.save(warehouse);
+    return this.parseWarehouse(warehouse);
+  }
+
+  async create(
+    createWarehouseDto: CreateWarehouseDto,
+    actor?: { id?: string; email?: string },
+  ) {
+    const codeStr = createWarehouseDto.code || '';
+    if (!codeStr.trim()) {
+      throw new BadRequestException('Warehouse code is required');
+    }
+    const normalizedCode = codeStr.trim().toUpperCase();
+    const existingCode = await this.findByCode(normalizedCode);
+    if (existingCode) {
+      throw new BadRequestException('Warehouse code already exists');
+    }
+
+    const warehouse = this.repo.create({
+      id: createWarehouseDto.id?.trim() || this.generateId(),
+      code: normalizedCode,
+      name: (createWarehouseDto.name || '').trim(),
+      address: (createWarehouseDto.address || '').trim(),
+      status: createWarehouseDto.status || 'active',
+      managerIds: Array.isArray(createWarehouseDto.managerIds) ? createWarehouseDto.managerIds.join(',') : '',
+      staffIds: Array.isArray(createWarehouseDto.staffIds) ? createWarehouseDto.staffIds.join(',') : '',
+      subWarehouses: createWarehouseDto.subWarehouses ? (createWarehouseDto.subWarehouses as any) : [],
+    });
+
+    const saved = await this.repo.save(warehouse);
+
+    await this.auditLogService.append({
+      actorId: actor?.id,
+      actorEmail: actor?.email,
+      action: 'WAREHOUSE_CREATED',
+      resource: 'warehouses',
+      resourceId: saved.id,
+      metadata: { code: saved.code, name: saved.name },
+    });
+
+    return this.parseWarehouse(saved);
+  }
+
+  async update(
+    id: string,
+    updateWarehouseDto: UpdateWarehouseDto,
+    actor?: { id?: string; email?: string },
+  ) {
+    const warehouse = await this.findOneEntity(id);
+
+    if (updateWarehouseDto.code && updateWarehouseDto.code !== warehouse.code) {
+      const normalizedCode = (updateWarehouseDto.code || '').trim().toUpperCase();
+      const existingCode = await this.findByCode(normalizedCode);
+      if (existingCode) {
+        throw new BadRequestException('Warehouse code already exists');
+      }
+      warehouse.code = normalizedCode;
+    }
+
+    if (updateWarehouseDto.name !== undefined) {
+      warehouse.name = (updateWarehouseDto.name || '').trim();
+    }
+
+    if (updateWarehouseDto.address !== undefined) {
+      warehouse.address = (updateWarehouseDto.address || '').trim();
+    }
+
+    if (updateWarehouseDto.status !== undefined) {
+      warehouse.status = updateWarehouseDto.status;
+    }
+
+    if (updateWarehouseDto.managerIds !== undefined) {
+      warehouse.managerIds = Array.isArray(updateWarehouseDto.managerIds) ? updateWarehouseDto.managerIds.join(',') : '';
+    }
+
+    if (updateWarehouseDto.staffIds !== undefined) {
+      warehouse.staffIds = Array.isArray(updateWarehouseDto.staffIds) ? updateWarehouseDto.staffIds.join(',') : '';
+    }
+
+    if (updateWarehouseDto.subWarehouses !== undefined) {
+      (warehouse as any).subWarehouses = updateWarehouseDto.subWarehouses;
+    }
+
+    const updated = await this.repo.save(warehouse);
+
+    await this.auditLogService.append({
+      actorId: actor?.id,
+      actorEmail: actor?.email,
+      action: 'WAREHOUSE_UPDATED',
+      resource: 'warehouses',
+      resourceId: id,
+      metadata: { code: updated.code, name: updated.name },
+    });
+
+    return this.parseWarehouse(updated);
+  }
+
+  async remove(id: string, actor?: { id?: string; email?: string }): Promise<void> {
+    const warehouse = await this.findOneEntity(id);
+    await this.repo.remove(warehouse);
+
+    await this.auditLogService.append({
+      actorId: actor?.id,
+      actorEmail: actor?.email,
+      action: 'WAREHOUSE_DELETED',
+      resource: 'warehouses',
+      resourceId: id,
+      metadata: { code: warehouse.code, name: warehouse.name },
+    });
+  }
+
+  private generateId(): string {
+    return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  }
+}

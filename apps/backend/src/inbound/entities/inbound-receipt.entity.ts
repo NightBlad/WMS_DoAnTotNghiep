@@ -1,0 +1,82 @@
+import { Column, Entity, ManyToOne, OneToMany } from 'typeorm';
+import { BaseEntity } from '../../entities/base.entity';
+import { Supplier } from '../../entities/supplier.entity';
+import { InboundDetail } from './inbound-detail.entity';
+
+@Entity('inbound_receipts')
+export class InboundReceipt extends BaseEntity {
+  @ManyToOne(() => Supplier, { nullable: true })
+  supplier?: Supplier;
+
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  supplierName?: string;
+
+  @Column({ nullable: true, unique: true })
+  poNumber?: string;
+
+  @Column({ type: 'datetime', nullable: true })
+  orderDate?: Date;
+
+  @Column({ type: 'datetime', nullable: true })
+  expectedDate?: Date;
+
+  @Column({ nullable: true })
+  status?: string;
+
+  @Column({ type: 'varchar', length: 50, nullable: true, default: 'stock_in' })
+  receiptType?: string;
+
+  @Column({ nullable: true })
+  approverId?: string;
+
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  approverName?: string;
+
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  creatorName?: string;
+
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  creatorPhone?: string;
+
+  @Column({ type: 'text', nullable: true })
+  description?: string;
+
+  @Column({ type: 'decimal', precision: 15, scale: 2, default: 0 })
+  subtotal: string;
+
+  @Column({ type: 'decimal', precision: 15, scale: 2, default: 0 })
+  discount: string;
+
+  @Column({ type: 'decimal', precision: 5, scale: 2, default: 0 })
+  vatRate: string;
+
+  @Column({ type: 'decimal', precision: 15, scale: 2, default: 0 })
+  vatAmount: string;
+
+  @Column({ type: 'decimal', precision: 15, scale: 2, default: 0 })
+  shippingFee: string;
+
+  @Column({ type: 'decimal', precision: 15, scale: 2, default: 0 })
+  totalAmount: string;
+
+  @Column({ type: 'decimal', precision: 15, scale: 2, default: 0 })
+  amountPaid: string;
+
+  @Column({ type: 'decimal', precision: 15, scale: 2, default: 0 })
+  debtAmount: string;
+
+  @Column({ type: 'varchar', length: 100, nullable: true })
+  paymentMethod?: string;
+
+  @Column({ type: 'varchar', length: 255, nullable: true })
+  paymentAccount?: string;
+
+  @Column({ type: 'varchar', length: 100, nullable: true })
+  warehouseCode?: string;
+
+  @Column({ type: 'varchar', length: 100, nullable: true })
+  branchCode?: string;
+
+  @OneToMany(() => InboundDetail, (d) => d.inboundReceipt)
+  details: InboundDetail[];
+}

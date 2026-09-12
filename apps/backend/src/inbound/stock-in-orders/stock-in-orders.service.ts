@@ -1,0 +1,529 @@
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+import { AuditLogService } from '../../audit-log/audit-log.service';
+import { StockBalance } from '../../inventory/entities/stock-balance.entity';
+import { NotificationsService } from '../../notifications/notifications.service';
+import { Product } from '../../entities/product.entity';
+import { InboundReceipt } from '../entities/inbound-receipt.entity';
+import { InboundDetail } from '../entities/inbound-detail.entity';
+import { CreateStockInOrderDto } from './dto/create-stock-in-order.dto';
+import { UpdateStockInOrderDto } from './dto/update-stock-in-order.dto';
+import { CompleteStockInOrderDto } from './dto/complete-stock-in-order.dto';
+import { StockInOrder } from './entities/stock-in-order.entity';
+import { StockInOrderDetail } from './entities/stock-in-order-detail.entity';
+import { StockInReceiptsService } from '../stock-in-receipts/stock-in-receipts.service';
+
+type UserContext = {
+  id?: string;
+  email?: string;
+};
+
+type AuditLogItem = {
+  id: string;
+  action: string;
+  resource: string;
+  resourceId?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: Date;
+  actorEmail?: string;
+  actorId?: string;
+};
+
+function toNumber(value: unknown) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function toIso(value?: Date | string | null) {
+  if (!value) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+@Injectable()
+export class StockInOrdersService {
+  constructor(
+    @InjectRepository(StockInOrder) private readonly orderRepo: Repository<StockInOrder>,
+    @InjectRepository(StockInOrderDetail) private readonly detailRepo: Repository<StockInOrderDetail>,
+    @InjectRepository(InboundReceipt) private readonly receiptRepo: Repository<InboundReceipt>,
+    @InjectRepository(InboundDetail) private readonly receiptDetailRepo: Repository<InboundDetail>,
+    @InjectRepository(Product) private readonly productRepo: Repository<Product>,
+    @InjectRepository(StockBalance) private readonly balanceRepo: Repository<StockBalance>,
+    private readonly stockInReceiptsService: StockInReceiptsService,
+    private readonly auditLogService: AuditLogService,
+    private readonly notificationsService: NotificationsService,
+  ) {}
+
+  async findAll() {
+    const orders = await this.orderRepo.find({
+      relations: ['sourcePurchaseOrder', 'sourcePurchaseOrder.supplier', 'details', 'details.product'],
+      order: { createdAt: 'DESC' },
+    });
+
+    return Promise.all(orders.map((order) => this.serializeOrder(order)));
+  }
+
+  async findOne(id: string) {
+    const order = await this.findOrderEntity(id);
+    return this.serializeOrder(order, true);
+  }
+
+  async createFromPurchaseOrder(sourcePurchaseOrderId: string, dto: CreateStockInOrderDto, user?: UserContext) {
+    const purchaseOrder = await this.receiptRepo.findOne({
+      where: { id: sourcePurchaseOrderId },
+      relations: ['details', 'details.product', 'supplier'],
+    });
+
+    if (!purchaseOrder) {
+      throw new NotFoundException('Purchase order not found');
+    }
+
+    const purchaseOrderStatus = String(purchaseOrder.status || '').toUpperCase();
+    if (purchaseOrderStatus !== 'SUPPLIER_APPROVED' && purchaseOrderStatus !== 'PARTIALLY_RECEIVED' && purchaseOrderStatus !== 'RECEIVED') {
+      throw new BadRequestException('Purchase order must be approved by supplier before creating stock in order');
+    }
+
+    const orderCode = await this.generateOrderCode(dto.orderCode, purchaseOrder.poNumber);
+    const createStatus = this.normalizeCreateStatus(dto.status);
+    const savedOrder = await this.orderRepo.save(
+      this.orderRepo.create({
+        orderCode,
+        sourcePurchaseOrder: purchaseOrder,
+        sourcePurchaseOrderNo: purchaseOrder.poNumber,
+        status: createStatus,
+        currentStepUserEmail: dto.currentStepUserEmail?.trim() || user?.email,
+        note: dto.note?.trim() || undefined,
+      }),
+    );
+
+    const details = (purchaseOrder.details || []).map((purchaseDetail) =>
+      this.detailRepo.create({
+        stockInOrder: savedOrder,
+        product: purchaseDetail.product,
+        warehouseCode: purchaseDetail.warehouseCode || 'KHO-NVL',
+        requestedQty: toNumber(purchaseDetail.expectedQty),
+        actualQty: 0,
+        unitPrice: toNumber(purchaseDetail.unitPrice).toFixed(2),
+        totalLineAmount: (toNumber(purchaseDetail.unitPrice) * toNumber(purchaseDetail.expectedQty)).toFixed(2),
+        weight: Math.min(999999.99, toNumber(purchaseDetail.weight)),
+        length: Math.min(999999.99, toNumber(purchaseDetail.length)),
+        width: Math.min(999999.99, toNumber(purchaseDetail.width)),
+        height: Math.min(999999.99, toNumber(purchaseDetail.height)),
+        volume: Math.min(999999.9999, toNumber(purchaseDetail.volume)),
+        volumetricWeight: Math.min(999999.99, toNumber(purchaseDetail.volumetricWeight)),
+        note: purchaseDetail.note || '',
+      }),
+    );
+
+    if (details.length) {
+      await this.detailRepo.save(details);
+    }
+
+    await this.appendLog(savedOrder.id, 'workflow.create', user, {
+      sourcePurchaseOrderId,
+      sourcePurchaseOrderNo: purchaseOrder.poNumber,
+      detailCount: details.length,
+    });
+
+    return this.serializeOrder(await this.findOrderEntity(savedOrder.id), true);
+  }
+
+  async update(id: string, dto: UpdateStockInOrderDto, user?: UserContext) {
+    const order = await this.findOrderEntity(id);
+
+    if (order.status === 'READY' || order.status === 'COMPLETED' || order.status === 'CANCELLED') {
+      throw new BadRequestException('Cannot update a finished stock in order');
+    }
+
+    if (dto.note !== undefined) {
+      order.note = dto.note.trim() || undefined;
+    }
+
+    if (dto.currentStepUserEmail !== undefined) {
+      order.currentStepUserEmail = dto.currentStepUserEmail.trim() || undefined;
+    }
+
+    if (dto.status) {
+      order.status = dto.status;
+    }
+
+    if (dto.details?.length) {
+      for (const line of dto.details) {
+        const detail = order.details.find((item) => item.id === line.id);
+        if (!detail) continue;
+
+        const nextRequested = line.requestedQty !== undefined ? toNumber(line.requestedQty) : toNumber(detail.requestedQty);
+        const nextActual = line.actualQty !== undefined ? toNumber(line.actualQty) : toNumber(detail.actualQty);
+
+        if (nextActual > nextRequested) {
+          throw new BadRequestException('Actual quantity cannot exceed requested quantity');
+        }
+
+        detail.requestedQty = nextRequested;
+        detail.actualQty = nextActual;
+
+        if (line.warehouseCode !== undefined) {
+          detail.warehouseCode = line.warehouseCode.trim() || undefined;
+        }
+
+        if (line.unitPrice !== undefined) {
+          const unitPrice = toNumber(line.unitPrice);
+          detail.unitPrice = unitPrice.toFixed(2);
+          detail.totalLineAmount = (unitPrice * nextRequested).toFixed(2);
+        }
+      }
+
+      await this.detailRepo.save(order.details);
+    }
+
+    await this.orderRepo.save(order);
+    await this.appendLog(id, 'workflow.update', user, {
+      status: order.status,
+      note: order.note,
+    });
+
+    return this.serializeOrder(await this.findOrderEntity(id), true);
+  }
+
+  async transition(id: string, dto: { nextStepUserEmail?: string; note?: string }, user?: UserContext) {
+    const order = await this.findOrderEntity(id);
+
+    if (order.status !== 'READY') {
+      throw new BadRequestException('Can only transition an approved stock in order');
+    }
+
+    order.currentStepUserEmail = dto.nextStepUserEmail?.trim() || undefined;
+    if (dto.note !== undefined) {
+      order.note = dto.note.trim() || undefined;
+    }
+    order.status = 'IN_PROGRESS';
+    await this.orderRepo.save(order);
+
+    await this.appendLog(id, 'workflow.transition', user, {
+      nextStepUserEmail: order.currentStepUserEmail,
+      note: order.note,
+    });
+
+    return this.serializeOrder(await this.findOrderEntity(id), true);
+  }
+
+  async complete(id: string, dto: CompleteStockInOrderDto, user?: UserContext) {
+    const order = await this.findOrderEntity(id);
+
+    if (order.status !== 'IN_PROGRESS') {
+      throw new BadRequestException('Can only complete a stock in order after entering quantities');
+    }
+
+    const invalid = order.details.find((detail) => toNumber(detail.actualQty) > toNumber(detail.requestedQty));
+    if (invalid) {
+      throw new BadRequestException(
+        `Mat hang ${invalid.product?.internalSku || invalid.product?.name || invalid.id} co SL thuc nhap vuot SL yeu cau`,
+      );
+    }
+
+    const hasDifference = order.details.some((detail) => toNumber(detail.actualQty) !== toNumber(detail.requestedQty));
+    if (hasDifference && !dto.confirmDifference) {
+      throw new BadRequestException('Co chenh lech so luong. Hay xac nhan chenh lech truoc khi hoan thanh.');
+    }
+
+    // Inventory adjustment is now handled by StockInReceipt when POSTED
+
+    order.status = 'COMPLETED';
+    order.completedAt = new Date();
+    order.currentStepUserEmail = dto.nextStepUserEmail?.trim() || order.currentStepUserEmail;
+    await this.orderRepo.save(order);
+
+    if (order.sourcePurchaseOrder) {
+      order.sourcePurchaseOrder.status = hasDifference ? 'PARTIALLY_RECEIVED' : 'RECEIVED';
+      await this.receiptRepo.save(order.sourcePurchaseOrder);
+    }
+
+    try {
+      await this.stockInReceiptsService.createFromStockInOrder(order.id, { status: 'ASSIGNED' }, user);
+    } catch {
+      // Phiếu có thể đã được tạo thủ công; không chặn hoàn thành lệnh.
+    }
+
+    await this.appendLog(id, 'workflow.complete', user, {
+      confirmDifference: Boolean(dto.confirmDifference),
+      nextStepUserEmail: order.currentStepUserEmail,
+      actualQtyTotal: order.details.reduce((sum, detail) => sum + toNumber(detail.actualQty), 0),
+    });
+
+    return this.serializeOrder(await this.findOrderEntity(id), true);
+  }
+
+  async distribute(id: string, detailId: string, dto: { qty: number; balanceId: string }, user?: UserContext) {
+    const order = await this.findOrderEntity(id);
+    const detail = order.details.find((d) => d.id === detailId);
+
+    if (!detail) {
+      throw new NotFoundException('Stock in order detail not found');
+    }
+
+    const qty = toNumber(dto.qty);
+    if (qty <= 0) {
+      throw new BadRequestException('So luong phan phoi phai lon hon 0');
+    }
+
+    const available = toNumber(detail.actualQty) - toNumber(detail.distributedQty) - toNumber(detail.producedQty);
+    if (qty > available) {
+      throw new BadRequestException('So luong phan phoi vuot qua so luong con lai cua don hang');
+    }
+
+    detail.distributedQty = toNumber(detail.distributedQty) + qty;
+    await this.detailRepo.save(detail);
+
+    // Update physical inventory
+    const locationCode = detail.warehouseCode || 'DEFAULT';
+    const balance = await this.balanceRepo.findOne({ 
+      where: { product: { id: detail.product.id } as any, locationCode }, 
+      relations: ['product'] 
+    });
+    
+    if (!balance) {
+      throw new NotFoundException(`Stock balance not found for product ${detail.product.id} at ${locationCode}`);
+    }
+    balance.totalPhysical -= qty;
+    balance.available = Math.max(balance.totalPhysical - balance.allocated, 0);
+    await this.balanceRepo.save(balance);
+
+    await this.appendLog(id, 'workflow.distribute', user, {
+      detailId,
+      qty,
+      locationCode,
+    });
+
+    return this.serializeOrder(await this.findOrderEntity(id), true);
+  }
+
+  async remove(id: string) {
+    const order = await this.findOrderEntity(id);
+    if (order.status !== 'DRAFT') {
+      throw new BadRequestException('Only draft stock in orders can be deleted');
+    }
+    await this.orderRepo.remove(order);
+    return { deleted: true };
+  }
+
+  async notifyAssignees(id: string, user?: UserContext) {
+    const order = await this.findOrderEntity(id);
+    if (order.status !== 'READY') {
+      throw new BadRequestException('Notifications can only be sent for approved stock in orders');
+    }
+
+    const identifiers = (order.currentStepUserEmail || '')
+      .split(',')
+      .map((email) => email.trim())
+      .filter(Boolean);
+
+    if (identifiers.length === 0) {
+      throw new BadRequestException('No assigned staff found for this stock in order');
+    }
+
+    const results = await Promise.all(
+      identifiers.map((identifier) =>
+        this.notificationsService.notifyUserByIdentifier(identifier, {
+          title: `Lệnh nhập kho ${order.orderCode} cần nhập số lượng`,
+          message: `Lệnh nhập kho ${order.orderCode} đã được duyệt. Vui lòng mở lệnh để nhập số lượng kiểm kê và hoàn tất xử lý.`,
+          link: `/inbound/stock-in-orders?orderId=${order.id}`,
+          referenceType: 'stock-in-order',
+          referenceId: order.id,
+          priority: 'high',
+        }),
+      ),
+    );
+
+    await this.appendLog(id, 'workflow.notify-assignees', user, {
+      notifiedCount: results.filter(Boolean).length,
+      assignees: identifiers,
+    });
+
+    return {
+      notified: results.filter(Boolean).length,
+    };
+  }
+
+  private async findOrderEntity(id: string) {
+    let order = await this.orderRepo.findOne({
+      where: { id },
+      relations: ['sourcePurchaseOrder', 'sourcePurchaseOrder.supplier', 'details', 'details.product'],
+    });
+
+    if (!order) {
+      order = await this.orderRepo.findOne({
+        where: [
+          { orderCode: id },
+          { sourcePurchaseOrder: { id } },
+          { sourcePurchaseOrderNo: id },
+        ],
+        relations: ['sourcePurchaseOrder', 'sourcePurchaseOrder.supplier', 'details', 'details.product'],
+      });
+    }
+
+    if (!order) {
+      throw new NotFoundException('Stock in order not found');
+    }
+
+    return order;
+  }
+
+  private async appendLog(resourceId: string, action: string, user?: UserContext, metadata?: Record<string, unknown>) {
+    await this.auditLogService.append({
+      actorId: user?.id,
+      actorEmail: user?.email,
+      action,
+      resource: 'stock-in-order',
+      resourceId,
+      metadata,
+    });
+  }
+
+  private async adjustInventory(productId: string, locationCode: string, qty: number) {
+    const product = await this.productRepo.findOneBy({ id: productId });
+    if (!product) {
+      throw new NotFoundException('Product not found');
+    }
+
+    const existing = await this.balanceRepo.findOne({
+      where: { product: { id: productId } as any, locationCode },
+      relations: ['product'],
+    });
+
+    if (existing) {
+      existing.totalPhysical += qty;
+      existing.available = Math.max(existing.totalPhysical - existing.allocated, 0);
+      await this.balanceRepo.save(existing);
+      return existing;
+    }
+
+    return this.balanceRepo.save(
+      this.balanceRepo.create({
+        product,
+        locationCode,
+        totalPhysical: qty,
+        allocated: 0,
+        available: qty,
+      }),
+    );
+  }
+
+  private normalizeCreateStatus(status?: string) {
+    return String(status || '').toUpperCase() === 'READY' ? 'READY' : 'DRAFT';
+  }
+
+  private getMonthWindow(now = new Date()) {
+    const start = new Date(now);
+    start.setDate(1);
+    start.setHours(0, 0, 0, 0);
+
+    const end = new Date(start);
+    end.setMonth(end.getMonth() + 1);
+
+    return { start, end };
+  }
+
+  private normalizeOrderCodePrefix(value?: string) {
+    const trimmed = value?.trim().toUpperCase();
+    return trimmed || 'LNK';
+  }
+
+  private async generateOrderCode(preferred?: string, sourcePurchaseOrderNo?: string) {
+    const requested = preferred?.trim().toUpperCase();
+    if (requested) {
+      const existing = await this.orderRepo.findOne({ where: { orderCode: requested } });
+      if (!existing) return requested;
+    }
+
+    const { start, end } = this.getMonthWindow();
+    const monthlyCount = await this.orderRepo
+      .createQueryBuilder('stockInOrder')
+      .where('stockInOrder.createdAt >= :start AND stockInOrder.createdAt < :end', {
+        start: start.toISOString(),
+        end: end.toISOString(),
+      })
+      .getCount();
+
+    const prefix = this.normalizeOrderCodePrefix(sourcePurchaseOrderNo);
+    let index = monthlyCount + 1;
+    let code = `${prefix}-${String(index).padStart(4, '0')}`;
+
+    while (await this.orderRepo.findOne({ where: { orderCode: code } })) {
+      index += 1;
+      code = `${prefix}-${String(index).padStart(4, '0')}`;
+    }
+
+    return code;
+  }
+
+  private async serializeOrder(order: StockInOrder, includeLogs = false) {
+    const logs = includeLogs ? await this.auditLogService.findByResource('stock-in-order', order.id) : [];
+
+    return {
+      id: order.id,
+      orderCode: order.orderCode,
+      sourcePurchaseOrderId: order.sourcePurchaseOrder?.id,
+      sourcePurchaseOrderNo: order.sourcePurchaseOrderNo || order.sourcePurchaseOrder?.poNumber || '-',
+      sourcePurchaseOrder: order.sourcePurchaseOrder
+        ? {
+            id: order.sourcePurchaseOrder.id,
+            poNumber: order.sourcePurchaseOrder.poNumber || `DMH${String(order.sourcePurchaseOrder.id).padStart(5, '0')}`,
+            supplier: order.sourcePurchaseOrder.supplier
+              ? {
+                  id: order.sourcePurchaseOrder.supplier.id,
+                  name: order.sourcePurchaseOrder.supplier.name,
+                  supplierCode: order.sourcePurchaseOrder.supplier.supplierCode,
+                }
+              : order.sourcePurchaseOrder.supplierName
+                ? { id: '', name: order.sourcePurchaseOrder.supplierName, supplierCode: '' }
+                : null,
+          }
+        : null,
+      status: order.status,
+      currentStepUserEmail: order.currentStepUserEmail,
+      note: order.note,
+      completedAt: toIso(order.completedAt),
+      createdAt: toIso(order.createdAt),
+      updatedAt: toIso(order.updatedAt),
+      details: (order.details || []).map((detail) => ({
+        id: detail.id,
+        warehouseCode: detail.warehouseCode,
+        requestedQty: toNumber(detail.requestedQty),
+        actualQty: toNumber(detail.actualQty),
+        distributedQty: toNumber(detail.distributedQty),
+        producedQty: toNumber(detail.producedQty),
+        unitPrice: toNumber(detail.unitPrice),
+        totalLineAmount: toNumber(detail.totalLineAmount),
+        weight: toNumber(detail.weight),
+        length: toNumber(detail.length),
+        width: toNumber(detail.width),
+        height: toNumber(detail.height),
+        volume: toNumber(detail.volume),
+        volumetricWeight: toNumber(detail.volumetricWeight),
+        note: detail.note || '',
+        product: detail.product
+          ? {
+              id: detail.product.id,
+              internalSku: detail.product.internalSku,
+              name: detail.product.name,
+              unit: detail.product.unit,
+            }
+          : null,
+      })),
+      totalRequestedQty: (order.details || []).reduce((sum, detail) => sum + toNumber(detail.requestedQty), 0),
+      totalActualQty: (order.details || []).reduce((sum, detail) => sum + toNumber(detail.actualQty), 0),
+      totalAmount: (order.details || []).reduce((sum, detail) => sum + toNumber(detail.totalLineAmount), 0),
+      logs: (logs as AuditLogItem[]).map((log) => ({
+        id: log.id,
+        action: log.action,
+        resource: log.resource,
+        resourceId: log.resourceId,
+        metadata: log.metadata,
+        createdAt: toIso(log.createdAt),
+        actorEmail: log.actorEmail,
+        actorId: log.actorId,
+      })),
+    };
+  }
+}

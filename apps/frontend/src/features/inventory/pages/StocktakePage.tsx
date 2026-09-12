@@ -1,0 +1,2490 @@
+import React from 'react';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import CreateStocktakeOrderPage from './CreateStocktakeOrderPage';
+import StocktakeApproveShelfModal from '../components/StocktakeApproveShelfModal';
+import {
+  Search,
+  Plus,
+  ClipboardList,
+  X,
+  XCircle,
+  CheckCircle,
+  Eye,
+  Trash2,
+  Check,
+  Ban,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+  PackageSearch,
+  ListChecks,
+  Clock,
+  ShieldCheck,
+  AlertTriangle,
+  Printer,
+  FileSpreadsheet,
+  FileDown,
+  Settings2,
+  Settings,
+  Home,
+  Calendar,
+  Filter,
+  Download,
+  RefreshCw,
+  ChevronDown,
+  Camera,
+  Maximize2,
+  Minimize2,
+  Copy,
+} from 'lucide-react';
+import BarcodeScanner, { ScanBarcodeButton, type ScannedProduct } from '../../../shared/components/BarcodeScanner';
+
+// ─── TOAST ─────────────────────────────────────────────────────
+
+function Toast({ message, type, onClose }: { message: string; type: 'success' | 'error'; onClose: () => void }) {
+  React.useEffect(() => {
+    if (message) {
+      const timer = setTimeout(() => onClose(), 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [message, onClose]);
+
+  if (!message) return null;
+
+  return (
+    <div className="fixed top-6 right-6 z-[99999] pointer-events-none">
+      <div
+        className={`pointer-events-auto flex items-center gap-3 rounded-2xl px-5 py-3.5 shadow-lg border transition-all animate-in slide-in-from-top-4 duration-200 ${
+          type === 'error'
+            ? 'bg-red-50 text-red-600 border-red-200'
+            : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+        }`}
+      >
+        {type === 'error' ? (
+          <XCircle size={20} className="shrink-0 text-red-600" />
+        ) : (
+          <CheckCircle size={20} className="shrink-0 text-emerald-600" />
+        )}
+        <p className="text-sm font-bold tracking-normal">{message}</p>
+        <button
+          type="button"
+          onClick={onClose}
+          className="ml-2 rounded-lg p-1 hover:bg-black/5 transition cursor-pointer"
+          title="Đóng thông báo"
+        >
+          <X size={16} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── TYPES ─────────────────────────────────────────────────────
+
+interface StocktakeDetail {
+  id: string;
+  systemQty: number;
+  countedQty: number | null;
+  difference: number;
+  note?: string;
+  product: {
+    id: string;
+    internalSku: string;
+    name: string;
+    unit?: string;
+  } | null;
+}
+
+interface StocktakeItem {
+  id: string;
+  stocktakeNo: string;
+  locationCode: string;
+  status: string;
+  plannedDate?: string;
+  assignee?: string;
+  note?: string;
+  createdBy?: string;
+  approvedBy?: string;
+  approvedAt?: string;
+  createdAt: string;
+  details: StocktakeDetail[];
+  totalItems: number;
+  countedItems: number;
+  differenceItems: number;
+}
+
+interface ProductOption {
+  id: string;
+  internalSku: string;
+  name: string;
+  unit?: string;
+}
+
+// ─── API HELPERS ───────────────────────────────────────────────
+
+const API_BASE = 'http://localhost:3000/api';
+
+function authHeaders() {
+  const token = localStorage.getItem('token') || '';
+  const userStr = localStorage.getItem('user');
+  let role = '';
+  let permissions: string[] = [];
+  try {
+    if (userStr) {
+      const u = JSON.parse(userStr);
+      role = u.role || (u.roles && u.roles[0]?.name) || '';
+      permissions = u.permissions || [];
+    }
+  } catch {}
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  if (userStr) {
+    try {
+      headers['x-user'] = encodeURIComponent(userStr);
+    } catch {}
+  }
+  if (role) {
+    try {
+      headers['x-role'] = encodeURIComponent(role);
+    } catch {}
+  }
+  if (permissions.length) {
+    try {
+      headers['x-permissions'] = encodeURIComponent(permissions.join(','));
+    } catch {
+      headers['x-permissions'] = permissions.join(',');
+    }
+  }
+  return headers;
+}
+
+// ─── STATUS CONFIG ─────────────────────────────────────────────
+
+const STATUS_MAP: Record<string, { label: string; color: string; bg: string; border: string }> = {
+  REQUESTED: { label: 'Yêu cầu', color: 'text-violet-700', bg: 'bg-violet-50', border: 'border-violet-200' },
+  DRAFT: { label: 'Nháp', color: 'text-slate-600', bg: 'bg-slate-100', border: 'border-slate-200' },
+  COUNTING: { label: 'Đang đếm', color: 'text-amber-700', bg: 'bg-amber-50', border: 'border-amber-200' },
+  COUNTING_DONE: { label: 'Chờ duyệt', color: 'text-blue-700', bg: 'bg-blue-50', border: 'border-blue-200' },
+  APPROVED: { label: 'Đã duyệt', color: 'text-emerald-700', bg: 'bg-emerald-50', border: 'border-emerald-200' },
+  REJECTED: { label: 'Từ chối', color: 'text-red-700', bg: 'bg-red-50', border: 'border-red-200' },
+};
+
+function StatusBadge({ status }: { status: string }) {
+  const config = STATUS_MAP[status] || STATUS_MAP.DRAFT;
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-bold border ${config.color} ${config.bg} ${config.border}`}>
+      {config.label}
+    </span>
+  );
+}
+
+function toLocalDateStr(val?: string | Date | null): string {
+  if (!val) return '';
+  const d = new Date(val);
+  if (isNaN(d.getTime())) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function getStartOfMonthStr(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  return `${y}-${m}-01`;
+}
+
+function getEndOfMonthStr(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = d.getMonth() + 1;
+  const lastDay = new Date(y, m, 0).getDate();
+  return `${y}-${String(m).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+}
+
+function getTodayLocalDateStr(): string {
+  return toLocalDateStr(new Date());
+}
+
+function getDaysAgoStr(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return toLocalDateStr(d);
+}
+
+// ─── MAIN PAGE ─────────────────────────────────────────────────
+
+export default function StocktakePage({ viewMode = 'stocktake' }: { viewMode?: 'requests' | 'create' | 'stocktake' | 'my-tasks' | 'request-new' }) {
+  const [stocktakes, setStocktakes] = React.useState<StocktakeItem[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [search, setSearch] = React.useState('');
+  const [toast, setToast] = React.useState({ message: '', type: 'success' as 'success' | 'error' });
+  const [isFullScreen, setIsFullScreen] = React.useState(false);
+
+  const toggleBrowserFullscreen = () => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch(() => {});
+      setIsFullScreen(true);
+    } else {
+      if (document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      }
+      setIsFullScreen(false);
+    }
+  };
+
+  // Pagination
+  const [pageSize, setPageSize] = React.useState(20);
+  const [currentPage, setCurrentPage] = React.useState(1);
+
+  // Modals
+  const [showCreateModal, setShowCreateModal] = React.useState(false);
+  const [showDetailModal, setShowDetailModal] = React.useState(false);
+  const [approveModalStocktake, setApproveModalStocktake] = React.useState<StocktakeItem | null>(null);
+
+  // RIC-style: date range filter
+  const [datePreset, setDatePreset] = React.useState<'this-month' | 'today' | '7days' | '30days' | 'all' | 'custom'>('this-month');
+  const [dateFrom, setDateFrom] = React.useState(() => getStartOfMonthStr());
+  const [dateTo, setDateTo] = React.useState(() => getEndOfMonthStr());
+  // RIC-style: show detail toggle
+  const [showDetail, setShowDetail] = React.useState(false);
+  // Selected rows for bulk actions
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
+
+  // Column Visibility settings (matching sample page)
+  const DEFAULT_COLUMN_VIS = {
+    nv: true,
+    code: true,
+    location: true,
+    date: true,
+    totalDiff: true,
+    note: true,
+    status: true,
+    productSku: true,
+    productName: true,
+    systemQty: true,
+    countedQty: true,
+    difference: true,
+  };
+
+  const COLUMN_LIST = [
+    { key: 'nv', label: 'NV', isDetail: false },
+    { key: 'code', label: 'Mã', isDetail: false },
+    { key: 'location', label: 'Kho', isDetail: false },
+    { key: 'date', label: 'Ngày', isDetail: false },
+    { key: 'totalDiff', label: 'Tổng lệch', isDetail: false },
+    { key: 'status', label: 'Trạng thái', isDetail: false },
+    { key: 'productSku', label: 'Mã hàng', isDetail: true },
+    { key: 'productName', label: 'Tên hàng', isDetail: true },
+    { key: 'systemQty', label: 'Tồn', isDetail: true },
+    { key: 'countedQty', label: 'Thực tồn', isDetail: true },
+    { key: 'difference', label: 'Lệch', isDetail: true },
+    { key: 'note', label: 'Ghi chú', isDetail: false },
+  ];
+
+  const [columnVis, setColumnVis] = React.useState<Record<string, boolean>>(() => {
+    try {
+      const saved = localStorage.getItem('stocktake_column_vis');
+      return saved ? { ...DEFAULT_COLUMN_VIS, ...JSON.parse(saved) } : DEFAULT_COLUMN_VIS;
+    } catch {
+      return DEFAULT_COLUMN_VIS;
+    }
+  });
+
+  React.useEffect(() => {
+    localStorage.setItem('stocktake_column_vis', JSON.stringify(columnVis));
+  }, [columnVis]);
+
+  const [showColumnSettings, setShowColumnSettings] = React.useState(false);
+
+  const currentUser = JSON.parse(localStorage.getItem('user') || '{}');
+  const userRole = currentUser.role || '';
+  const userIdentifier = currentUser.fullName || currentUser.email || '';
+  const isManager = userRole === 'manager' || userRole === 'admin';
+  const isStaff = userRole === 'staff';
+
+  const navigate = useNavigate();
+  React.useEffect(() => {
+    if (isStaff && (viewMode === 'requests' || viewMode === 'request-new')) {
+      navigate('/inventory/stocktake', { replace: true });
+    }
+  }, [isStaff, viewMode, navigate]);
+
+  const isRequestsView = viewMode === 'requests';
+  const isCreateView = viewMode === 'create';
+  const isMyTasksView = viewMode === 'my-tasks';
+  const isRequestNewView = viewMode === 'request-new';
+
+  const pageTitle = isRequestsView ? 'Yêu cầu kiểm kê từ nhân viên'
+    : isCreateView ? 'Tạo phiên kiểm kê'
+      : isMyTasksView ? 'Kiểm kê của tôi'
+        : isRequestNewView ? 'Gửi yêu cầu kiểm kê'
+          : 'Kiểm kê kho hàng';
+  const pageSubtitle = isRequestsView
+    ? 'Danh sách yêu cầu kiểm kê từ nhân viên cần tiếp nhận và xử lý.'
+    : isCreateView
+      ? 'Tạo mới một phiên kiểm kê để bắt đầu kiểm kê hàng hóa.'
+      : isMyTasksView
+        ? 'Danh sách phiên kiểm kê được giao cho bạn.'
+        : isRequestNewView
+          ? 'Tạo yêu cầu kiểm kê và gửi cho quản lý phê duyệt.'
+          : 'Tạo phiên kiểm kê, đếm thực tế, so sánh chênh lệch và cập nhật tồn kho.';
+  const defaultIsRequest = isRequestsView || isRequestNewView;
+  const [selectedStocktake, setSelectedStocktake] = React.useState<StocktakeItem | null>(null);
+
+  // ── Data Loading ────────────────────────────────────────────
+
+  const loadData = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      // Choose API endpoint based on view mode with anti-cache timestamp
+      const ts = Date.now();
+      let url = `${API_BASE}/inventory/stocktakes?_t=${ts}`;
+      if (isMyTasksView || isRequestNewView) {
+        url = `${API_BASE}/inventory/stocktakes/my-tasks?_t=${ts}`;
+      } else if (isRequestsView) {
+        url = `${API_BASE}/inventory/stocktakes/requests?_t=${ts}`;
+      }
+      const res = await fetch(url, {
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => null);
+        throw new Error(errData?.message || 'Không tải được dữ liệu kiểm kê');
+      }
+      const data = await res.json();
+      setStocktakes(Array.isArray(data) ? data : (data?.data || []));
+    } catch (err) {
+      setToast({ message: err instanceof Error ? err.message : 'Lỗi hệ thống', type: 'error' });
+    } finally {
+      setLoading(false);
+    }
+  }, [isMyTasksView, isRequestsView, isRequestNewView]);
+
+  React.useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  React.useEffect(() => {
+    if (isCreateView) {
+      setShowCreateModal(true);
+    }
+  }, [isCreateView]);
+
+  React.useEffect(() => {
+    setCurrentPage(1);
+  }, [search]);
+
+  // ── Filter & Pagination ─────────────────────────────────────
+
+  const filtered = stocktakes.filter((s) => {
+    const kw = search.trim().toLowerCase();
+    const matchKeyword = !kw ||
+      s.stocktakeNo.toLowerCase().includes(kw) ||
+      s.locationCode.toLowerCase().includes(kw) ||
+      (s.createdBy || '').toLowerCase().includes(kw) ||
+      (s.assignee || '').toLowerCase().includes(kw) ||
+      (STATUS_MAP[s.status]?.label || '').toLowerCase().includes(kw);
+
+    // Date range filter
+    if (dateFrom || dateTo) {
+      const itemDate = s.plannedDate ? toLocalDateStr(s.plannedDate)
+        : s.createdAt ? toLocalDateStr(s.createdAt) : '';
+      if (dateFrom && itemDate && itemDate < dateFrom) return false;
+      if (dateTo && itemDate && itemDate > dateTo) return false;
+    }
+
+    return matchKeyword;
+  });
+
+  const displayedStocktakes = filtered;
+
+  const totalItems = displayedStocktakes.length;
+  const totalPages = Math.ceil(totalItems / pageSize) || 1;
+  const paginated = displayedStocktakes.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const startIndex = totalItems > 0 ? (currentPage - 1) * pageSize + 1 : 0;
+  const endIndex = Math.min(currentPage * pageSize, totalItems);
+
+  // ── Summary ─────────────────────────────────────────────────
+
+  const totalAll = stocktakes.length;
+  const totalCounting = stocktakes.filter((s) => s.status === 'COUNTING').length;
+  const totalWaiting = stocktakes.filter((s) => s.status === 'COUNTING_DONE').length;
+  const totalApproved = stocktakes.filter((s) => s.status === 'APPROVED').length;
+  const totalRequests = stocktakes.filter((s) => s.status === 'REQUESTED').length;
+
+  // Footer totals computation
+  const footerTotalTon = paginated.reduce((sum, item) => {
+    if (!item.details) return sum;
+    return sum + item.details.reduce((s, d) => s + (d.systemQty || 0), 0);
+  }, 0);
+  const footerTotalThucTon = paginated.reduce((sum, item) => {
+    if (!item.details) return sum;
+    return sum + item.details.reduce((s, d) => s + (d.countedQty || 0), 0);
+  }, 0);
+  const footerTotalLech = paginated.reduce((sum, item) => {
+    if (!item.details) return sum;
+    return sum + item.details.reduce((s, d) => s + (d.difference || 0), 0);
+  }, 0);
+  const footerTotalTongLech = footerTotalLech;
+
+  // ── Actions ─────────────────────────────────────────────────
+
+  const showSuccess = (msg: string) => setToast({ message: msg, type: 'success' });
+  const showError = (msg: string) => setToast({ message: msg, type: 'error' });
+  const hasAcceptPermission = isManager;
+
+  const handleViewDetail = async (id: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/inventory/stocktakes/${id}`, { headers: authHeaders() });
+      if (!res.ok) throw new Error('Không tải được chi tiết');
+      const data = await res.json();
+      setSelectedStocktake(data);
+      setShowDetailModal(true);
+    } catch (err) {
+      showError(err instanceof Error ? err.message : 'Lỗi');
+    }
+  };
+
+  const handleAcceptRequest = async (id: string) => {
+    try {
+      const user = JSON.parse(localStorage.getItem('user') || '{}');
+      const res = await fetch(`${API_BASE}/inventory/stocktakes/${id}/accept`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ acceptedBy: user.fullName || user.email || '' }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.message || 'Không thể tiếp nhận yêu cầu');
+      }
+      showSuccess('Đã tiếp nhận yêu cầu kiểm kê');
+      loadData();
+      if (selectedStocktake?.id === id) handleViewDetail(id);
+    } catch (err) {
+      showError(err instanceof Error ? err.message : 'Lỗi');
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!confirm('Bạn chắc chắn muốn xóa phiên kiểm kê này?')) return;
+    try {
+      const res = await fetch(`${API_BASE}/inventory/stocktakes/${id}`, {
+        method: 'DELETE',
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.message || 'Không thể xóa');
+      }
+      showSuccess('Đã xóa phiên kiểm kê');
+      loadData();
+    } catch (err) {
+      showError(err instanceof Error ? err.message : 'Lỗi');
+    }
+  };
+
+  const handleApprove = async (id: string) => {
+    // 1. Kiểm tra nếu đã có sẵn trong danh sách và có details thì mở ngay popup
+    const found = stocktakes.find((s) => String(s.id) === String(id));
+    if (found && found.details && found.details.length > 0) {
+      setApproveModalStocktake(found);
+      return;
+    }
+    // 2. Nếu chưa có chi tiết, fetch đầy đủ rồi mở popup duyệt điều chỉnh từng kệ
+    try {
+      const res = await fetch(`${API_BASE}/inventory/stocktakes/${id}`, { headers: authHeaders() });
+      if (res.ok) {
+        const fullData = await res.json();
+        setApproveModalStocktake(fullData);
+      } else {
+        throw new Error('Không tải được chi tiết phiếu kiểm kê');
+      }
+    } catch (err: any) {
+      showError(err.message || 'Lỗi');
+    }
+  };
+
+  const handleReject = async (id: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/inventory/stocktakes/${id}/reject`, {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.message || 'Không thể từ chối');
+      }
+      showSuccess('Đã từ chối phiên kiểm kê');
+      loadData();
+      if (selectedStocktake?.id === id) handleViewDetail(id);
+    } catch (err) {
+      showError(err instanceof Error ? err.message : 'Lỗi');
+    }
+  };
+
+  // ── Bulk delete ─────────────────────────────────────────────
+  const handleBulkDelete = async () => {
+    if (selectedIds.size === 0) { showError('Chưa chọn phiên nào để xóa'); return; }
+    if (!confirm(`Xóa ${selectedIds.size} phiên kiểm kê đã chọn?`)) return;
+    let deleted = 0;
+    for (const id of selectedIds) {
+      try {
+        const res = await fetch(`${API_BASE}/inventory/stocktakes/${id}`, { method: 'DELETE', headers: authHeaders() });
+        if (res.ok) deleted++;
+      } catch { /* skip */ }
+    }
+    showSuccess(`Đã xóa ${deleted}/${selectedIds.size} phiên`);
+    setSelectedIds(new Set());
+    loadData();
+  };
+
+  const handleDeleteSingleStocktake = async (id: string, stocktakeNo: string) => {
+    if (!confirm(`Bạn có chắc chắn muốn xóa phiên kiểm kê ${stocktakeNo}?`)) return;
+    try {
+      const res = await fetch(`${API_BASE}/inventory/stocktakes/${id}`, { method: 'DELETE', headers: authHeaders() });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.message || 'Xóa không thành công');
+      }
+      showSuccess(`Đã xóa phiên kiểm kê ${stocktakeNo}`);
+      loadData();
+    } catch (err: any) {
+      showError(err.message || 'Lỗi khi xóa phiên kiểm kê');
+    }
+  };
+
+  // ── Toggle select ───────────────────────────────────────────
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const toggleSelectAll = () => {
+    if (selectedIds.size === paginated.length) setSelectedIds(new Set());
+    else setSelectedIds(new Set(paginated.map(s => s.id)));
+  };
+
+  // ── Render ──────────────────────────────────────────────────
+
+  // Dynamic base columns count for empty / loading states & detail mode
+  const isDetailActive =
+    showDetail ||
+    Boolean(
+      columnVis.productSku ||
+      columnVis.productName ||
+      columnVis.systemQty ||
+      columnVis.countedQty ||
+      columnVis.difference,
+    );
+
+  const visibleMainCount = [
+    columnVis.nv,
+    columnVis.code,
+    columnVis.location,
+    columnVis.date,
+    columnVis.totalDiff,
+    columnVis.note,
+    columnVis.status,
+  ].filter(Boolean).length;
+
+  const visibleDetailCount = isDetailActive
+    ? [
+      columnVis.productSku,
+      columnVis.productName,
+      columnVis.systemQty,
+      columnVis.countedQty,
+      columnVis.difference,
+    ].filter(Boolean).length
+    : 0;
+
+  const baseColCount = 3 + visibleMainCount + visibleDetailCount;
+
+  const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const action = searchParams.get('action');
+  const showCreateForm = action === 'create' || isCreateView || showCreateModal;
+
+  React.useEffect(() => {
+    if (!showCreateForm) {
+      loadData();
+    }
+  }, [showCreateForm, location.search, location.pathname, loadData]);
+
+  // Tự động nạp dữ liệu tức thì khi tạo phiếu kiểm kê xong mà không cần F5
+  React.useEffect(() => {
+    const locState = location.state as any;
+    if (locState?.newCreatedStocktake || locState?.refreshTime) {
+      setDatePreset('all');
+      setDateFrom('');
+      setDateTo('');
+      loadData();
+    }
+  }, [location.state, loadData]);
+
+  React.useEffect(() => {
+    const recentStr = localStorage.getItem('recent_stocktake_created');
+    if (recentStr) {
+      try {
+        const recent = JSON.parse(recentStr);
+        if (recent?.timestamp && Date.now() - recent.timestamp < 30000) {
+          setDatePreset('all');
+          setDateFrom('');
+          setDateTo('');
+          loadData();
+        }
+      } catch {}
+      localStorage.removeItem('recent_stocktake_created');
+    }
+  }, [loadData]);
+
+  if (showCreateForm) {
+    return (
+      <CreateStocktakeOrderPage
+        standalone={false}
+        onBack={(createdData) => {
+          setSearchParams({});
+          setShowCreateModal(false);
+          if (createdData) {
+            setDatePreset('all');
+            setDateFrom('');
+            setDateTo('');
+            setStocktakes((prev) => {
+              const exists = prev.some(
+                (s) => String(s.id) === String(createdData.id) || s.stocktakeNo === createdData.stocktakeNo
+              );
+              return exists ? prev : [createdData, ...prev];
+            });
+          }
+          loadData();
+        }}
+      />
+    );
+  }
+
+  return (
+    <>
+      <Toast message={toast.message} type={toast.type} onClose={() => setToast({ message: '', type: 'success' })} />
+
+      <div className={`space-y-6 ${isFullScreen ? 'fixed inset-0 z-[9000] bg-white overflow-y-auto p-6' : ''}`}>
+        <div className="space-y-6 animate-in fade-in duration-200">
+        {/* Top Header Section matching Inbound/Outbound */}
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <div className="inline-flex items-center gap-2.5 rounded-2xl bg-cyan-600 px-5 py-2.5 text-white shadow-md">
+              <ClipboardList className="h-5 w-5" />
+              <h1 className="text-xl font-extrabold tracking-tight">{pageTitle.toUpperCase()}</h1>
+            </div>
+          </div>
+
+          {/* Action Buttons Top Right aligned in Cyan style */}
+          <div className="flex flex-wrap items-center gap-3">
+            {/* 1. Thêm mới */}
+            <button
+              type="button"
+              onClick={() => setSearchParams({ action: 'create' })}
+              className="inline-flex items-center justify-center gap-2 rounded-xl border-2 border-cyan-700 bg-white px-5 py-2.5 text-sm font-extrabold text-cyan-700 shadow-xs transition hover:bg-cyan-50 active:scale-95 cursor-pointer"
+            >
+              <Plus className="h-4.5 w-4.5 text-cyan-700" />
+              Thêm mới
+            </button>
+
+            {/* 2. AI Kiểm kê */}
+            {isManager && (
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const res = await fetch('http://localhost:3000/api/inventory/smart-stocktake/generate-recommended', {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${localStorage.getItem('token') || ''}`,
+                      },
+                      body: JSON.stringify({ createdBy: 'Smart AI Risk Engine' }),
+                    });
+                    if (!res.ok) {
+                      const err = await res.json().catch(() => null);
+                      throw new Error(err?.message || 'Không có sản phẩm nguy cơ cao nào');
+                    }
+                    const created = await res.json();
+                    setToast({ message: `Đã tự động khởi tạo phiên kiểm kê thông minh ${created.stocktakeNo} pre-filled danh sách rủi ro cao!`, type: 'success' });
+                    await loadData();
+                  } catch (err: any) {
+                    setToast({ message: err.message || 'Lỗi', type: 'error' });
+                  }
+                }}
+                className="inline-flex items-center justify-center gap-2 rounded-xl border-2 border-purple-700 bg-purple-50 px-5 py-2.5 text-sm font-extrabold text-purple-700 shadow-xs transition hover:bg-purple-100 active:scale-95 cursor-pointer"
+              >
+                <ShieldCheck className="h-4.5 w-4.5 text-purple-700" />
+                AI Kiểm kê
+              </button>
+            )}
+
+            {/* 3. Xóa */}
+            <button
+              type="button"
+              onClick={handleBulkDelete}
+              className="inline-flex items-center justify-center gap-2 rounded-xl border-2 border-cyan-700 bg-white px-5 py-2.5 text-sm font-extrabold text-cyan-700 shadow-xs transition hover:bg-cyan-50 active:scale-95 cursor-pointer"
+            >
+              <Trash2 className="h-4.5 w-4.5 text-cyan-700" />
+              Xóa {selectedIds.size > 0 ? `(${selectedIds.size})` : ''}
+            </button>
+
+            {/* 4. In báo cáo */}
+            <button
+              type="button"
+              onClick={() => window.print()}
+              className="inline-flex items-center justify-center gap-2 rounded-xl border-2 border-cyan-700 bg-white px-5 py-2.5 text-sm font-extrabold text-cyan-700 shadow-xs transition hover:bg-cyan-50 active:scale-95 cursor-pointer"
+            >
+              <Printer className="h-4.5 w-4.5 text-cyan-700" />
+              In báo cáo
+            </button>
+
+            {/* 5. Export Excel */}
+            <button
+              type="button"
+              onClick={() => {
+                const header = ['STT', 'Mã', 'NV', 'Kho', 'Ngày', 'Tổng lệch', 'Ghi chú', 'Trạng thái'];
+                const rows = displayedStocktakes.map((s, i) => [
+                  i + 1,
+                  s.stocktakeNo,
+                  s.assignee || s.createdBy || '',
+                  s.locationCode || '',
+                  s.plannedDate ? new Date(s.plannedDate).toLocaleDateString('vi-VN') : '',
+                  s.details ? s.details.reduce((sum, d) => sum + d.difference, 0) : 0,
+                  s.note || '',
+                  STATUS_MAP[s.status]?.label || s.status,
+                ]);
+                const csv = [header, ...rows].map(r => r.map(cell => `"${cell}"`).join(',')).join('\n');
+                const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `kiem_ke_${new Date().toISOString().slice(0, 10)}.csv`;
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+              className="inline-flex items-center justify-center gap-2 rounded-xl border-2 border-cyan-700 bg-white px-5 py-2.5 text-sm font-extrabold text-cyan-700 shadow-xs transition hover:bg-cyan-50 active:scale-95 cursor-pointer"
+            >
+              <FileSpreadsheet className="h-4.5 w-4.5 text-cyan-700" />
+              Export Excel
+            </button>
+
+            {/* 6. Settings */}
+            <button
+              type="button"
+              onClick={() => setShowColumnSettings(true)}
+              className="inline-flex items-center justify-center gap-2 h-10 px-4 rounded-xl border-2 border-cyan-700 bg-white text-cyan-700 font-extrabold text-sm shadow-xs transition hover:bg-cyan-50 active:scale-95 cursor-pointer"
+              title="Cấu hình hiển thị cột"
+            >
+              <Settings className="h-4.5 w-4.5 text-cyan-700" />
+              <span>Hiển thị</span>
+            </button>
+
+            {/* 7. Toàn màn hình */}
+            <button
+              type="button"
+              onClick={toggleBrowserFullscreen}
+              className="inline-flex items-center justify-center h-10 w-10 rounded-xl border-2 border-slate-300 bg-white text-slate-700 shadow-xs transition hover:bg-slate-100 active:scale-95 cursor-pointer"
+              title="Toàn màn hình"
+            >
+              {isFullScreen ? <Minimize2 className="h-4.5 w-4.5" /> : <Maximize2 className="h-4.5 w-4.5" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Filter & Search Panel */}
+        <div className="rounded-2xl border-2 border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+            {/* Search input - Matching height (h-12) */}
+            <div className="relative flex-1 min-w-[320px]">
+              <Search className="pointer-events-none absolute left-4 top-1/2 h-4.5 w-4.5 -translate-y-1/2 text-cyan-600" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="h-12 w-full rounded-xl border-2 border-cyan-600/40 bg-white pl-11 pr-4 text-xs font-bold text-slate-800 outline-none transition focus:border-cyan-600 focus:ring-4 focus:ring-cyan-500/10 shadow-2xs"
+                placeholder="Tìm theo mã kiểm kê, kho, người tạo, trạng thái..."
+              />
+            </div>
+
+            {/* Date Filters Container & Show detail toggle */}
+            <div className="flex flex-wrap items-center gap-3">
+              {/* Date Filter Box (h-12) */}
+              <div className="inline-flex h-12 items-center gap-2 rounded-xl border-2 border-cyan-600/30 bg-slate-50/80 px-3 shadow-2xs">
+                <div className="flex items-center gap-1.5">
+                  <Calendar className="h-4 w-4 text-cyan-600 shrink-0" />
+                  <span className="text-xs font-extrabold uppercase text-cyan-950 tracking-wide">Thời gian:</span>
+                </div>
+
+                <select
+                  value={datePreset}
+                  onChange={(e) => {
+                    const preset = e.target.value as any;
+                    setDatePreset(preset);
+                    setCurrentPage(1);
+                    if (preset === 'this-month') {
+                      setDateFrom(getStartOfMonthStr());
+                      setDateTo(getEndOfMonthStr());
+                    } else if (preset === 'today') {
+                      setDateFrom(getTodayLocalDateStr());
+                      setDateTo(getTodayLocalDateStr());
+                    } else if (preset === '7days') {
+                      setDateFrom(getDaysAgoStr(7));
+                      setDateTo(getTodayLocalDateStr());
+                    } else if (preset === '30days') {
+                      setDateFrom(getDaysAgoStr(30));
+                      setDateTo(getTodayLocalDateStr());
+                    } else if (preset === 'all') {
+                      setDateFrom('');
+                      setDateTo('');
+                    }
+                  }}
+                  className="h-8.5 rounded-lg border border-slate-300 bg-white px-2 text-xs font-bold text-slate-800 outline-none transition focus:border-cyan-600 cursor-pointer shadow-2xs"
+                >
+                  <option value="this-month">Tháng này</option>
+                  <option value="today">Hôm nay</option>
+                  <option value="7days">7 ngày qua</option>
+                  <option value="30days">30 ngày qua</option>
+                  <option value="all">Tất cả</option>
+                  <option value="custom">Tùy chọn</option>
+                </select>
+
+                <div className="flex items-center gap-1">
+                  <span className="text-xs font-bold text-slate-500">Từ</span>
+                  <input
+                    type="date"
+                    value={dateFrom}
+                    onChange={(e) => {
+                      setDateFrom(e.target.value);
+                      setDatePreset('custom');
+                      setCurrentPage(1);
+                    }}
+                    className="h-8.5 rounded-lg border border-slate-300 bg-white px-2 text-xs font-bold text-slate-800 outline-none transition focus:border-cyan-600 cursor-pointer"
+                  />
+                </div>
+                <div className="flex items-center gap-1">
+                  <span className="text-xs font-bold text-slate-500">Đến</span>
+                  <input
+                    type="date"
+                    value={dateTo}
+                    onChange={(e) => {
+                      setDateTo(e.target.value);
+                      setDatePreset('custom');
+                      setCurrentPage(1);
+                    }}
+                    className="h-8.5 rounded-lg border border-slate-300 bg-white px-2 text-xs font-bold text-slate-800 outline-none transition focus:border-cyan-600 cursor-pointer"
+                  />
+                </div>
+
+                {(dateFrom || dateTo) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDateFrom('');
+                      setDateTo('');
+                      setDatePreset('all');
+                      setCurrentPage(1);
+                    }}
+                    className="ml-1 rounded-lg bg-cyan-100 hover:bg-cyan-200 text-cyan-800 px-2 py-1 text-xs font-bold transition cursor-pointer"
+                    title="Xem tất cả các ngày"
+                  >
+                    Xem tất cả
+                  </button>
+                )}
+              </div>
+
+              {/* Detail toggle box (h-12) */}
+              <div className="inline-flex h-12 items-center gap-2.5 rounded-xl border-2 border-cyan-600/30 bg-slate-50/80 px-3.5 shadow-2xs">
+                <input
+                  type="checkbox"
+                  id="showDetailCheck"
+                  checked={isDetailActive}
+                  onChange={(e) => {
+                    const val = e.target.checked;
+                    setShowDetail(val);
+                    setColumnVis((prev) => ({
+                      ...prev,
+                      productSku: val,
+                      productName: val,
+                      systemQty: val,
+                      countedQty: val,
+                      difference: val,
+                    }));
+                  }}
+                  className="h-4.5 w-4.5 rounded border-slate-300 text-cyan-600 focus:ring-cyan-500 cursor-pointer"
+                />
+                <label htmlFor="showDetailCheck" className="text-xs font-extrabold uppercase text-cyan-950 tracking-wide cursor-pointer select-none">
+                  Hiện chi tiết
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Modal Hiện/Ẩn cột */}
+        {showColumnSettings && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 backdrop-blur-[1px]">
+            <div className="w-[360px] rounded-2xl border-2 border-cyan-500/40 bg-white shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-150">
+              <div className="flex items-center justify-between border-b-2 border-slate-200 bg-cyan-600 px-4 py-3 text-white">
+                <h3 className="text-sm font-extrabold uppercase tracking-wide">Cấu hình hiển thị cột</h3>
+                <button
+                  onClick={() => setShowColumnSettings(false)}
+                  className="rounded-lg p-1 text-white hover:bg-white/20 transition cursor-pointer"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              <div className="max-h-[380px] overflow-y-auto p-3">
+                <table className="w-full text-xs border-collapse border border-slate-200">
+                  <thead>
+                    <tr className="bg-cyan-50 font-extrabold text-slate-700">
+                      <th className="w-12 border border-slate-200 px-2 py-2 text-center">TT</th>
+                      <th className="border border-slate-200 px-3 py-2 text-left">Tên cột</th>
+                      <th className="w-24 border border-slate-200 px-2 py-2 text-center">
+                        <div className="flex items-center justify-center gap-1">
+                          <span>Hiện</span>
+                          <input
+                            type="checkbox"
+                            checked={COLUMN_LIST.every((col) => columnVis[col.key])}
+                            onChange={(e) => {
+                              const val = e.target.checked;
+                              const next = { ...columnVis };
+                              COLUMN_LIST.forEach((col) => { next[col.key] = val; });
+                              setColumnVis(next);
+                            }}
+                            className="h-4 w-4 rounded border-slate-300 text-cyan-600 focus:ring-cyan-500 cursor-pointer"
+                          />
+                        </div>
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200">
+                    {COLUMN_LIST.map((col, idx) => (
+                      <tr key={col.key} className="hover:bg-cyan-50/50 transition">
+                        <td className="border border-slate-200 px-2 py-2 text-center text-slate-600 font-bold">{idx + 1}</td>
+                        <td className="border border-slate-200 px-3 py-2 text-slate-700 font-bold">{col.label}</td>
+                        <td className="border border-slate-200 px-2 py-2 text-center">
+                          <input
+                            type="checkbox"
+                            checked={columnVis[col.key] ?? true}
+                            onChange={(e) => {
+                              setColumnVis((prev) => ({ ...prev, [col.key]: e.target.checked }));
+                            }}
+                            className="h-4 w-4 rounded border-slate-300 text-cyan-600 focus:ring-cyan-500 cursor-pointer"
+                          />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="flex justify-end border-t-2 border-slate-200 bg-slate-50 px-4 py-3">
+                <button
+                  type="button"
+                  onClick={() => setShowColumnSettings(false)}
+                  className="rounded-xl border-2 border-cyan-700 bg-cyan-600 px-5 py-2 text-xs font-black text-white shadow-xs hover:bg-cyan-700 transition cursor-pointer"
+                >
+                  Đóng
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Data Table */}
+        <div className="overflow-hidden rounded-2xl border-2 border-slate-200 bg-white shadow-sm">
+          <div className="overflow-x-auto custom-scrollbar">
+            <table className="w-full min-w-[1450px] border-collapse text-left">
+              {/* Table Header */}
+              <thead className="bg-cyan-50 sticky top-0 z-20 shadow-sm">
+                <tr className="border-b-2 border-slate-200 text-slate-800 font-extrabold uppercase text-xs sm:text-sm tracking-wider">
+                  <th className="w-12 min-w-[50px] border-r border-slate-200 px-2 py-4 text-center">
+                    <input
+                      type="checkbox"
+                      checked={paginated.length > 0 && selectedIds.size === paginated.length}
+                      onChange={toggleSelectAll}
+                      className="h-4.5 w-4.5 rounded border-slate-300 accent-cyan-600 focus:ring-cyan-500 cursor-pointer"
+                    />
+                  </th>
+                  <th className="w-14 min-w-[60px] border-r border-slate-200 px-3 py-4 text-center">STT</th>
+                  {columnVis.code && <th className="min-w-[210px] border-r border-slate-200 px-4 py-4 text-center whitespace-nowrap">Mã kiểm kê</th>}
+                  {columnVis.nv && <th className="min-w-[150px] border-r border-slate-200 px-3 py-4 text-center">Nhân viên</th>}
+                  {columnVis.location && <th className="min-w-[140px] border-r border-slate-200 px-3 py-4 text-center">Kho</th>}
+                  {columnVis.date && <th className="min-w-[130px] border-r border-slate-200 px-3 py-4 text-center">Ngày kiểm</th>}
+                  {columnVis.totalDiff && <th className="min-w-[130px] border-r border-slate-200 px-3 py-4 text-center">Tổng lệch</th>}
+                  {columnVis.status && <th className="min-w-[140px] border-r border-slate-200 px-3 py-4 text-center">Trạng thái</th>}
+                  {isDetailActive && (
+                    <>
+                      {columnVis.productSku && <th className="min-w-[130px] border-r border-slate-200 px-3 py-4 text-center">Mã hàng</th>}
+                      {columnVis.productName && <th className="min-w-[220px] border-r border-slate-200 px-4 py-4 text-center">Tên hàng</th>}
+                      {columnVis.systemQty && <th className="min-w-[110px] border-r border-slate-200 px-3 py-4 text-center">Tồn hệ thống</th>}
+                      {columnVis.countedQty && <th className="min-w-[110px] border-r border-slate-200 px-3 py-4 text-center">Thực tồn</th>}
+                      {columnVis.difference && <th className="min-w-[110px] border-r border-slate-200 px-3 py-4 text-center">Chênh lệch</th>}
+                    </>
+                  )}
+                  {columnVis.note && <th className="min-w-[200px] border-r border-slate-200 px-4 py-4 text-center">Ghi chú</th>}
+                  <th className="sticky right-0 top-0 z-30 w-36 min-w-[140px] bg-cyan-100 px-3 py-4 text-center shadow-[-4px_0_12px_rgba(0,0,0,0.05)] border-l border-slate-200 text-cyan-950 font-black">Thao tác</th>
+                </tr>
+              </thead>
+
+              {/* Table Body */}
+              <tbody className="divide-y divide-slate-200 bg-white">
+                {loading ? (
+                  <tr>
+                    <td colSpan={baseColCount} className="py-12 text-center text-slate-500 font-semibold text-sm">
+                      <div className="flex items-center justify-center gap-2">
+                        <RefreshCw className="h-5 w-5 animate-spin text-cyan-600" />
+                        Đang tải dữ liệu kiểm kê...
+                      </div>
+                    </td>
+                  </tr>
+                ) : paginated.length === 0 ? (
+                  <tr>
+                    <td colSpan={baseColCount} className="py-12 text-center text-slate-500 font-semibold text-sm">
+                      Không tìm thấy phiếu kiểm kê nào
+                    </td>
+                  </tr>
+                ) : (
+                  paginated.map((item, index) => {
+                    const itemDate = item.plannedDate ? new Date(item.plannedDate).toLocaleDateString('vi-VN')
+                      : item.createdAt ? new Date(item.createdAt).toLocaleDateString('vi-VN') : '';
+                    const totalDiff = item.details ? item.details.reduce((s, d) => s + d.difference, 0) : 0;
+                    const hasDetails = item.details && item.details.length > 0;
+                    const detailRows = isDetailActive && hasDetails ? item.details : [];
+                    const firstDetail = hasDetails ? item.details[0] : null;
+                    const extraDetails = detailRows.length > 1 ? detailRows.slice(1) : [];
+                    const detailNotes = item.details ? item.details.map(d => d.note).filter(Boolean).join('; ') : '';
+                    const displayNote = item.note ? (detailNotes ? `${item.note} (${detailNotes})` : item.note) : detailNotes;
+                    const isSelected = selectedIds.has(item.id);
+
+                    return (
+                      <React.Fragment key={item.id}>
+                        {/* Main row */}
+                        <tr className={`group transition cursor-pointer border-b border-slate-200 ${isSelected ? 'bg-cyan-100/60' : 'hover:bg-cyan-50/60'}`}>
+                          <td className="border-r border-slate-200 px-2 py-3.5 text-center" rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1} onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => toggleSelect(item.id)}
+                              className="h-4 w-4 rounded border-slate-300 text-cyan-600 focus:ring-cyan-500 cursor-pointer"
+                            />
+                          </td>
+                          <td className="border-r border-slate-200 px-3 py-3.5 text-center text-sm font-medium text-slate-700" rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1}>
+                            {startIndex + index}
+                          </td>
+                          {columnVis.code && (
+                            <td className="border-r border-slate-200 px-4 py-3.5 text-sm font-extrabold text-cyan-700 whitespace-nowrap" rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1}>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleViewDetail(item.id);
+                                }}
+                                className="text-cyan-700 hover:text-cyan-900 hover:underline font-extrabold text-left cursor-pointer whitespace-nowrap"
+                              >
+                                {item.stocktakeNo}
+                              </button>
+                            </td>
+                          )}
+                          {columnVis.nv && (
+                            <td className="border-r border-slate-200 px-3 py-3.5 text-center text-sm font-medium text-slate-700" rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1}>
+                              {item.assignee || item.createdBy || '—'}
+                            </td>
+                          )}
+                          {columnVis.location && (
+                            <td className="border-r border-slate-200 px-3 py-3.5 text-center text-sm font-bold text-slate-800" rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1}>
+                              {item.locationCode || '—'}
+                            </td>
+                          )}
+                          {columnVis.date && (
+                            <td className="border-r border-slate-200 px-3 py-3.5 text-center text-sm font-medium text-slate-700" rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1}>
+                              {itemDate}
+                            </td>
+                          )}
+                          {columnVis.totalDiff && (
+                            <td className="border-r border-slate-200 px-3 py-3.5 text-center text-sm font-black" rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1}>
+                              <span className={totalDiff !== 0 ? 'text-red-600' : 'text-slate-500'}>
+                                {totalDiff !== 0 ? totalDiff.toFixed(1) : '0.0'}
+                              </span>
+                            </td>
+                          )}
+                          {columnVis.status && (
+                            <td className="border-r border-slate-200 px-3 py-3.5 text-center" rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1}>
+                              <StatusBadge status={item.status} />
+                            </td>
+                          )}
+                          {isDetailActive && (
+                            <>
+                              {columnVis.productSku && (
+                                <td className="border-r border-slate-200 px-3 py-3.5 text-center text-sm font-bold text-cyan-700">
+                                  {firstDetail?.product?.internalSku || (hasDetails ? 'SKU-N/A' : '—')}
+                                </td>
+                              )}
+                              {columnVis.productName && (
+                                <td className="border-r border-slate-200 px-4 py-3.5 text-sm font-extrabold text-slate-800">
+                                  {firstDetail?.product?.name || (hasDetails ? 'Sản phẩm kiểm kê' : '—')}
+                                </td>
+                              )}
+                              {columnVis.systemQty && (
+                                <td className="border-r border-slate-200 px-3 py-3.5 text-center text-sm font-bold text-slate-800">
+                                  {firstDetail ? firstDetail.systemQty.toLocaleString('vi-VN') : '—'}
+                                </td>
+                              )}
+                              {columnVis.countedQty && (
+                                <td className="border-r border-slate-200 px-3 py-3.5 text-center text-sm font-bold text-slate-800">
+                                  {firstDetail?.countedQty != null ? firstDetail.countedQty.toLocaleString('vi-VN') : '—'}
+                                </td>
+                              )}
+                              {columnVis.difference && (
+                                <td className="border-r border-slate-200 px-3 py-3.5 text-center text-sm font-black">
+                                  {firstDetail?.countedQty != null ? (
+                                    <span className={firstDetail.difference !== 0 ? 'text-red-600' : 'text-slate-500'}>
+                                      {firstDetail.difference}
+                                    </span>
+                                  ) : '—'}
+                                </td>
+                              )}
+                            </>
+                          )}
+                          {columnVis.note && (
+                            <td className="border-r border-slate-200 px-4 py-3.5 text-sm font-medium text-slate-600 max-w-[200px] truncate" title={displayNote} rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1}>
+                              {displayNote || '—'}
+                            </td>
+                          )}
+                          <td className="sticky right-0 z-10 w-36 min-w-[140px] bg-white group-hover:bg-cyan-50/90 px-3 py-3.5 text-center shadow-[-4px_0_12px_rgba(0,0,0,0.05)] border-l border-slate-200" rowSpan={isDetailActive && extraDetails.length > 0 ? extraDetails.length + 1 : 1}>
+                            <div className="flex items-center justify-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleViewDetail(item.id);
+                                }}
+                                title="Xem chi tiết"
+                                className="flex h-8 w-8 items-center justify-center rounded-xl border-2 border-cyan-500 bg-white text-cyan-600 shadow-sm transition hover:bg-cyan-50 hover:text-cyan-700 cursor-pointer"
+                              >
+                                <Eye size={16} strokeWidth={2.5} />
+                              </button>
+                              {(item.status === 'COUNTING_DONE' || item.status === 'COUNTING' || item.status === 'DRAFT') && isManager && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleApprove(item.id);
+                                    }}
+                                    title="Duyệt kiểm kê"
+                                    className="flex h-8 w-8 items-center justify-center rounded-xl border-2 border-emerald-500 bg-white text-emerald-600 shadow-sm transition hover:bg-emerald-50 hover:text-emerald-700 cursor-pointer"
+                                  >
+                                    <Check size={16} strokeWidth={2.5} />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleReject(item.id);
+                                    }}
+                                    title="Từ chối kiểm kê"
+                                    className="flex h-8 w-8 items-center justify-center rounded-xl border-2 border-red-500 bg-white text-red-600 shadow-sm transition hover:bg-red-50 hover:text-red-700 cursor-pointer"
+                                  >
+                                    <Ban size={16} strokeWidth={2.5} />
+                                  </button>
+                                </>
+                              )}
+                              {item.status === 'REQUESTED' && hasAcceptPermission && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleAcceptRequest(item.id);
+                                  }}
+                                  title="Tiếp nhận yêu cầu"
+                                  className="flex h-8 w-8 items-center justify-center rounded-xl border-2 border-purple-500 bg-white text-purple-600 shadow-sm transition hover:bg-purple-50 hover:text-purple-700 cursor-pointer"
+                                >
+                                  <Check size={16} strokeWidth={2.5} />
+                                </button>
+                              )}
+                              {isManager && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteSingleStocktake(item.id, item.stocktakeNo);
+                                  }}
+                                  title="Xóa phiên kiểm kê"
+                                  className="flex h-8 w-8 items-center justify-center rounded-xl border-2 border-rose-500 bg-white text-rose-600 shadow-sm transition hover:bg-rose-50 hover:text-rose-700 cursor-pointer"
+                                >
+                                  <Trash2 size={16} strokeWidth={2.5} />
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+
+                        {/* Extra detail rows */}
+                        {isDetailActive && extraDetails.map((detail, dIdx) => (
+                          <tr key={`${item.id}-d-${dIdx}`} className="border-b border-slate-200 hover:bg-cyan-50/50 transition">
+                            {columnVis.productSku && (
+                              <td className="border-r border-slate-200 px-3 py-2.5 text-center text-sm font-bold text-cyan-700">
+                                {detail.product?.internalSku || ''}
+                              </td>
+                            )}
+                            {columnVis.productName && (
+                              <td className="border-r border-slate-200 px-4 py-2.5 text-sm font-extrabold text-slate-800">
+                                {detail.product?.name || ''}
+                              </td>
+                            )}
+                            {columnVis.systemQty && (
+                              <td className="border-r border-slate-200 px-3 py-2.5 text-center text-sm font-bold text-slate-800">
+                                {detail.systemQty.toLocaleString('vi-VN')}
+                              </td>
+                            )}
+                            {columnVis.countedQty && (
+                              <td className="border-r border-slate-200 px-3 py-2.5 text-center text-sm font-bold text-slate-800">
+                                {detail.countedQty != null ? detail.countedQty.toLocaleString('vi-VN') : ''}
+                              </td>
+                            )}
+                            {columnVis.difference && (
+                              <td className="border-r border-slate-200 px-3 py-2.5 text-center text-sm font-black">
+                                {detail.countedQty != null ? (
+                                  <span className={detail.difference !== 0 ? 'text-red-600' : 'text-slate-500'}>
+                                    {detail.difference}
+                                  </span>
+                                ) : ''}
+                              </td>
+                            )}
+                          </tr>
+                        ))}
+                      </React.Fragment>
+                    );
+                  })
+                )}
+              </tbody>
+
+              {/* Footer Totals */}
+              {!loading && paginated.length > 0 && (
+                <tfoot>
+                  <tr className="bg-slate-100 border-t-2 border-slate-300 font-extrabold text-slate-800 text-sm">
+                    <td
+                      colSpan={2 + (columnVis.code ? 1 : 0) + (columnVis.nv ? 1 : 0) + (columnVis.location ? 1 : 0) + (columnVis.date ? 1 : 0) + (!columnVis.totalDiff ? 1 : 0)}
+                      className="border-r border-slate-300 px-4 py-3.5 text-right font-black text-slate-800"
+                    >
+                      Tổng cộng:
+                    </td>
+                    {columnVis.totalDiff && (
+                      <td className="border-r border-slate-300 px-3 py-3.5 text-center font-black text-red-600">
+                        {footerTotalTongLech !== 0 ? footerTotalTongLech.toFixed(1) : '0.0'}
+                      </td>
+                    )}
+                    {columnVis.status && <td className="border-r border-slate-300 px-3 py-3.5" />}
+                    {isDetailActive && (
+                      <>
+                        {columnVis.productSku && <td className="border-r border-slate-300 px-3 py-3.5" />}
+                        {columnVis.productName && <td className="border-r border-slate-300 px-4 py-3.5" />}
+                        {columnVis.systemQty && (
+                          <td className="border-r border-slate-300 px-3 py-3.5 text-center font-black text-slate-900">
+                            {footerTotalTon.toLocaleString('vi-VN')}
+                          </td>
+                        )}
+                        {columnVis.countedQty && (
+                          <td className="border-r border-slate-300 px-3 py-3.5 text-center font-black text-slate-900">
+                            {footerTotalThucTon.toLocaleString('vi-VN')}
+                          </td>
+                        )}
+                        {columnVis.difference && (
+                          <td className="border-r border-slate-300 px-3 py-3.5 text-center font-black text-red-600">
+                            {footerTotalLech.toLocaleString('vi-VN')}
+                          </td>
+                        )}
+                      </>
+                    )}
+                    {columnVis.note && <td className="border-r border-slate-300 px-4 py-3.5" />}
+                    <td className="sticky right-0 z-10 bg-slate-100 border-l border-slate-300 px-3 py-3.5" />
+                  </tr>
+                </tfoot>
+              )}
+            </table>
+          </div>
+
+          {/* Pagination Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-4 border-t-2 border-slate-200 bg-slate-50/90 px-4 py-3.5 text-sm font-bold text-slate-700">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-extrabold text-slate-700">Hiển thị:</span>
+                <select
+                  value={pageSize}
+                  onChange={(e) => {
+                    setPageSize(Number(e.target.value));
+                    setCurrentPage(1);
+                  }}
+                  className="h-9 rounded-xl border-2 border-slate-300 bg-white px-3 text-sm font-black text-slate-800 outline-none transition focus:border-cyan-600 focus:ring-2 focus:ring-cyan-500/20 cursor-pointer shadow-xs"
+                >
+                  <option value={20}>20</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                  <option value={500}>500</option>
+                </select>
+                <span className="text-sm font-bold text-slate-600">dòng/trang</span>
+              </div>
+              <div className="border-l-2 border-slate-300 pl-3 text-sm font-semibold text-slate-600">
+                Hiển thị <span className="font-extrabold text-slate-900">{totalItems > 0 ? startIndex : 0}</span> -{' '}
+                <span className="font-extrabold text-slate-900">{endIndex}</span> trên tổng <span className="font-black text-cyan-800">{totalItems}</span> phiếu kiểm kê
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 text-sm font-bold">
+              <button
+                disabled={currentPage === 1}
+                onClick={() => setCurrentPage(1)}
+                className="flex h-9 w-9 items-center justify-center rounded-xl border-2 border-slate-300 bg-white text-slate-700 hover:bg-cyan-50 hover:border-cyan-600 hover:text-cyan-700 disabled:opacity-40 disabled:hover:bg-white disabled:hover:border-slate-300 disabled:hover:text-slate-700 transition cursor-pointer shadow-2xs"
+                title="Trang đầu"
+              >
+                <ChevronsLeft size={18} strokeWidth={2.5} />
+              </button>
+              <button
+                disabled={currentPage === 1}
+                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                className="flex h-9 w-9 items-center justify-center rounded-xl border-2 border-slate-300 bg-white text-slate-700 hover:bg-cyan-50 hover:border-cyan-600 hover:text-cyan-700 disabled:opacity-40 disabled:hover:bg-white disabled:hover:border-slate-300 disabled:hover:text-slate-700 transition cursor-pointer shadow-2xs"
+                title="Trang trước"
+              >
+                <ChevronLeft size={18} strokeWidth={2.5} />
+              </button>
+              <span className="px-2 text-sm font-extrabold text-slate-800">
+                Trang <span className="text-cyan-700 font-black">{currentPage}</span> / {totalPages}
+              </span>
+              <button
+                disabled={currentPage === totalPages}
+                onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                className="flex h-9 w-9 items-center justify-center rounded-xl border-2 border-slate-300 bg-white text-slate-700 hover:bg-cyan-50 hover:border-cyan-600 hover:text-cyan-700 disabled:opacity-40 disabled:hover:bg-white disabled:hover:border-slate-300 disabled:hover:text-slate-700 transition cursor-pointer shadow-2xs"
+                title="Trang tiếp"
+              >
+                <ChevronRight size={18} strokeWidth={2.5} />
+              </button>
+              <button
+                disabled={currentPage === totalPages}
+                onClick={() => setCurrentPage(totalPages)}
+                className="flex h-9 w-9 items-center justify-center rounded-xl border-2 border-slate-300 bg-white text-slate-700 hover:bg-cyan-50 hover:border-cyan-600 hover:text-cyan-700 disabled:opacity-40 disabled:hover:bg-white disabled:hover:border-slate-300 disabled:hover:text-slate-700 transition cursor-pointer shadow-2xs"
+                title="Trang cuối"
+              >
+                <ChevronsRight size={18} strokeWidth={2.5} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ═══ Footer Copyright ═══ */}
+      <div className="flex items-center justify-between mt-3 px-1">
+        <p className="text-xs text-slate-400">
+          Smart WMS - Copyright © 2008-2026 <span className="text-cyan-600 font-semibold">by Smart WMS Software.</span>
+        </p>
+        <p className="text-xs text-slate-400">Version 2026</p>
+      </div>
+
+      {/* ═══ Modals ═══ */}
+      {showCreateModal && (
+        <CreateStocktakeModal
+          defaultIsRequest={defaultIsRequest}
+          isStaff={isStaff}
+          isManager={isManager}
+          onClose={() => setShowCreateModal(false)}
+          onCreated={(created) => {
+            setShowCreateModal(false);
+            loadData();
+            if (isStaff) {
+              showSuccess('Đã gửi yêu cầu kiểm kê thành công');
+            } else {
+              const assigneeMsg = created?.assignee ? ` và đã gửi thông báo cho nhân viên ${created.assignee}` : '';
+              showSuccess(`Đã tạo phiên kiểm kê mới${assigneeMsg}`);
+            }
+          }}
+          onSaveAndAdd={(created) => { loadData(); showSuccess('Đã lưu yêu cầu, bạn có thể tạo tiếp'); }}
+          onError={showError}
+        />
+      )}
+      {showDetailModal && selectedStocktake && (
+        <StocktakeDetailModal
+          stocktake={selectedStocktake}
+          isManager={isManager}
+          isStaff={isStaff}
+          onClose={() => { setShowDetailModal(false); setSelectedStocktake(null); }}
+          onRefresh={async () => {
+            await loadData();
+            handleViewDetail(selectedStocktake.id);
+          }}
+          onApproveClick={(st) => {
+            setApproveModalStocktake(st);
+          }}
+          onSuccess={showSuccess}
+          onError={showError}
+        />
+      )}
+      {approveModalStocktake && (
+        <StocktakeApproveShelfModal
+          stocktake={approveModalStocktake}
+          onClose={() => setApproveModalStocktake(null)}
+          onApproved={(updated) => {
+            setApproveModalStocktake(null);
+            showSuccess(`Đã duyệt thành công phiếu kiểm kê ${updated?.stocktakeNo || approveModalStocktake.stocktakeNo} và cập nhật tồn kho từng kệ!`);
+            loadData();
+            if (selectedStocktake?.id === updated?.id) {
+              setSelectedStocktake(updated);
+            }
+          }}
+          onError={showError}
+        />
+      )}
+      </div>
+    </>
+  );
+}
+
+
+// ─── SUMMARY CARD ──────────────────────────────────────────────
+
+function SummaryCard({ icon: Icon, label, value, color }: { icon: any; label: string; value: number; color: string }) {
+  const colorMap: Record<string, { border: string; bg: string; textLabel: string; textValue: string; iconBg: string }> = {
+    cyan: { border: 'border-cyan-200', bg: 'bg-cyan-50', textLabel: 'text-cyan-800', textValue: 'text-cyan-600', iconBg: 'bg-cyan-100' },
+    amber: { border: 'border-amber-200', bg: 'bg-amber-50', textLabel: 'text-amber-800', textValue: 'text-amber-600', iconBg: 'bg-amber-100' },
+    blue: { border: 'border-blue-200', bg: 'bg-blue-50', textLabel: 'text-blue-800', textValue: 'text-blue-600', iconBg: 'bg-blue-100' },
+    emerald: { border: 'border-emerald-200', bg: 'bg-emerald-50', textLabel: 'text-emerald-800', textValue: 'text-emerald-600', iconBg: 'bg-emerald-100' },
+    violet: { border: 'border-violet-200', bg: 'bg-violet-50', textLabel: 'text-violet-800', textValue: 'text-violet-600', iconBg: 'bg-violet-100' },
+  };
+  const c = colorMap[color] || colorMap.cyan;
+
+  return (
+    <div className={`rounded-2xl border-2 ${c.border} ${c.bg} p-6 transition-all hover:shadow-md`}>
+      <div className="flex items-center gap-4">
+        <div className={`flex h-12 w-12 items-center justify-center rounded-xl ${c.iconBg}`}>
+          <Icon className={`h-6 w-6 ${c.textValue}`} />
+        </div>
+        <div>
+          <p className={`text-sm font-bold uppercase tracking-wider ${c.textLabel}`}>{label}</p>
+          <p className={`mt-1 text-3xl font-black ${c.textValue}`}>{value}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── CREATE MODAL ──────────────────────────────────────────────
+
+function CreateStocktakeModal({
+  onClose,
+  onCreated,
+  onSaveAndAdd,
+  onError,
+  defaultIsRequest = false,
+  isStaff = false,
+  isManager = false,
+}: {
+  onClose: () => void;
+  onCreated: (created?: any) => void;
+  onSaveAndAdd?: (created?: any) => void;
+  onError: (msg: string) => void;
+  defaultIsRequest?: boolean;
+  isStaff?: boolean;
+  isManager?: boolean;
+}) {
+  const modalUser = JSON.parse(localStorage.getItem('user') || '{}');
+  const userIdentifier = modalUser.fullName || modalUser.email || '';
+
+  const [locationCode, setLocationCode] = React.useState('');
+  const [plannedDate, setPlannedDate] = React.useState(() => new Date().toISOString().slice(0, 10));
+  const [assignee, setAssignee] = React.useState(isStaff ? userIdentifier : '');
+  const [note, setNote] = React.useState('');
+  const [branch, setBranch] = React.useState('');
+  const [purpose, setPurpose] = React.useState('');
+  const [reference, setReference] = React.useState('');
+
+  // RIC-style dynamic list
+  interface RicItem {
+    product: ProductOption & { systemQty?: number };
+    countedQty: number;
+    note: string;
+  }
+  const [items, setItems] = React.useState<RicItem[]>([]);
+  const [productSearch, setProductSearch] = React.useState('');
+  const [showDropdown, setShowDropdown] = React.useState(false);
+  const [submitting, setSubmitting] = React.useState(false);
+  const [scannerOpen, setScannerOpen] = React.useState(false);
+
+  const [warehouses, setWarehouses] = React.useState<any[]>([]);
+  const [users, setUsers] = React.useState<any[]>([]);
+  const [products, setProducts] = React.useState<any[]>([]);
+
+  React.useEffect(() => {
+    fetch(`${API_BASE}/warehouses`, { headers: authHeaders() })
+      .then((r) => r.json())
+      .then((data) => {
+        const list = Array.isArray(data) ? data : data?.data || [];
+        setWarehouses(list);
+        if (list.length > 0) setLocationCode(list[0].code);
+      })
+      .catch(() => { });
+
+    fetch(`${API_BASE}/users`, { headers: authHeaders() })
+      .then((r) => r.json())
+      .then((data) => setUsers(Array.isArray(data) ? data : data?.data || []))
+      .catch(() => { });
+
+    // Tải tất cả thông tin sản phẩm và số lượng tồn hệ thống thực tế của chúng
+    fetch(`${API_BASE}/products/with-balances`, { headers: authHeaders() })
+      .then((r) => r.json())
+      .then((data) => {
+        const list = Array.isArray(data) ? data : data?.data || [];
+        setProducts(list);
+      })
+      .catch(() => { });
+  }, []);
+
+  // Tự động cập nhật số lượng tồn hệ thống (và thực tồn nếu chưa chỉnh sửa) cho các sản phẩm đã chọn khi đổi Kho kiểm
+  React.useEffect(() => {
+    if (!locationCode || products.length === 0) return;
+    setItems((prevItems) => {
+      if (prevItems.length === 0) return prevItems;
+      return prevItems.map((item) => {
+        const p = products.find(
+          (prod) => prod.id === item.product.id || prod.internalSku === item.product.internalSku
+        );
+        const matchBal = p ? (p.stockBalances || []).find((b: any) => b.locationCode === locationCode) : null;
+        const newSystemQty = matchBal ? matchBal.totalPhysical : (p?.totalPhysical ?? p?.stockQty ?? 0);
+        const oldSystemQty = item.product.systemQty ?? 0;
+
+        // Nếu thực tồn bằng số tồn cũ (mặc định), cập nhật thực tồn bằng số tồn mới theo kho mới
+        const isCountedDefault = item.countedQty === oldSystemQty;
+        const newCountedQty = isCountedDefault ? newSystemQty : item.countedQty;
+
+        return {
+          ...item,
+          product: {
+            ...item.product,
+            systemQty: newSystemQty,
+          },
+          countedQty: newCountedQty,
+        };
+      });
+    });
+  }, [locationCode, products]);
+
+  const handleAddProduct = (p: any) => {
+    // Check if already in list
+    if (items.some(item => item.product.id === p.id)) {
+      setProductSearch('');
+      setShowDropdown(false);
+      return;
+    }
+    // Lấy tồn kho thực tế từ StockBalance theo kho đang chọn (locationCode)
+    const matchBal = (p.stockBalances || []).find((b: any) => b.locationCode === locationCode);
+    const systemQty = matchBal ? matchBal.totalPhysical : (p.totalPhysical ?? p.stockQty ?? 0);
+    setItems(prev => [
+      ...prev,
+      {
+        product: { id: p.id, internalSku: p.internalSku, name: p.name, unit: p.unit, systemQty },
+        countedQty: systemQty, // Khởi tạo thực tồn bằng số tồn hệ thống giống chuẩn RIC
+        note: ''
+      }
+    ]);
+    setProductSearch('');
+    setShowDropdown(false);
+  };
+
+  const handleUpdateCounted = (index: number, val: number) => {
+    setItems(prev => {
+      const next = [...prev];
+      next[index].countedQty = val;
+      return next;
+    });
+  };
+
+  const handleUpdateItemNote = (index: number, text: string) => {
+    setItems(prev => {
+      const next = [...prev];
+      next[index].note = text;
+      return next;
+    });
+  };
+
+  const handleRemoveItem = (index: number) => {
+    setItems(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const executeSubmit = async (finalStatus: string = 'DRAFT') => {
+    if (!locationCode) {
+      onError('Vui lòng chọn Kho / Vị trí kiểm kê');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const itemsPayload = items.map(item => ({
+        productId: String(item.product.id || item.product.internalSku),
+        countedQty: Number(item.countedQty) >= 0 ? Number(item.countedQty) : 0,
+        note: item.note || undefined,
+      }));
+      const productIds = items.map(item => String(item.product.id || item.product.internalSku));
+
+      // 1. Tạo phiên kiểm kê kèm mảng items đầy đủ thông tin (productId, countedQty, note)
+      const res = await fetch(`${API_BASE}/inventory/stocktakes`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          locationCode,
+          plannedDate: plannedDate ? new Date(plannedDate).toISOString() : undefined,
+          assignee: assignee || userIdentifier,
+          note: note.trim() || undefined,
+          isRequest: defaultIsRequest || undefined,
+          createdBy: userIdentifier,
+          branch,
+          purpose,
+          reference,
+          status: finalStatus,
+          items: itemsPayload.length > 0 ? itemsPayload : undefined,
+          productIds: productIds.length > 0 ? productIds : undefined,
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.message || 'Không thể tạo phiên kiểm kê');
+      }
+      const created = await res.json();
+
+      // 2. Nếu là hoàn tất kiểm kê (COUNTING_DONE), đảm bảo chuyển trạng thái nếu backend chưa tự động đổi
+      if (finalStatus === 'COUNTING_DONE' && items.length > 0 && created.status !== 'COUNTING_DONE' && created.status !== 'REQUESTED') {
+        const finishRes = await fetch(`${API_BASE}/inventory/stocktakes/${created.id}/finish-counting`, {
+          method: 'POST',
+          headers: authHeaders(),
+        });
+        if (finishRes.ok) {
+          const finishedData = await finishRes.json().catch(() => null);
+          if (finishedData) {
+            onCreated(finishedData);
+            return;
+          }
+        }
+      }
+
+      // 3. Fetch lại thông tin phiên kiểm kê mới nhất để trả về cho trang chính
+      const freshRes = await fetch(`${API_BASE}/inventory/stocktakes/${created.id}`, { headers: authHeaders() });
+      const freshData = freshRes.ok ? await freshRes.json() : created;
+
+      onCreated(freshData);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Lỗi');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const existingIds = new Set(items.map(item => item.product.id));
+  const filteredProducts = products.filter(p => {
+    const kw = productSearch.toLowerCase();
+    return !existingIds.has(p.id) && (p.name.toLowerCase().includes(kw) || p.internalSku.toLowerCase().includes(kw));
+  });
+
+  // Lấy thông tin user đăng nhập thực tế để hiển thị góc trên bên phải giống RIC
+  const storedUser = JSON.parse(localStorage.getItem('user') || '{}');
+  const userEmail = storedUser.email || 'guest@smartwms.vn';
+  const userPhone = storedUser.phone || '097.247.8383';
+
+  return (
+    <div className="fixed inset-y-0 right-0 left-20 lg:left-80 z-50 flex flex-col bg-slate-100 shadow-2xl border-l border-slate-300" onClick={(e) => e.stopPropagation()}>
+      {/* RIC Header Green Bar */}
+      <div className="flex h-11 items-center justify-between px-4 text-white" style={{ background: '#009688' }}>
+        <div className="flex items-center gap-2 font-bold text-sm">
+          <span>KIỂM KÊ</span>
+        </div>
+        <div className="flex items-center gap-2 text-xs font-semibold">
+          <span>☎ {userPhone}</span>
+          <select
+            value={locationCode}
+            onChange={(e) => setLocationCode(e.target.value)}
+            className="h-6 rounded bg-teal-800 border-none text-white px-2 py-0.5 text-xs outline-none cursor-pointer"
+          >
+            {warehouses.map(w => (
+              <option key={w.id} value={w.code} className="bg-teal-900 text-white">
+                {w.name}
+              </option>
+            ))}
+          </select>
+          <span>{userEmail}</span>
+        </div>
+      </div>
+
+      {/* Tabs bar */}
+      <div className="flex items-center gap-1 border-b border-slate-300 bg-slate-50 px-2 py-1 flex-shrink-0">
+        <button className="flex h-7 w-7 items-center justify-center rounded border border-slate-300 hover:bg-slate-200 text-slate-600 font-bold text-sm">
+          +
+        </button>
+        <div className="flex items-center gap-2 rounded-t-md border-t-2 border-l border-r border-teal-600 bg-white px-3 py-1 text-xs font-bold text-teal-700 shadow-sm">
+          <span>#1</span>
+          <button onClick={onClose} className="hover:text-red-500 font-black">✕</button>
+        </div>
+      </div>
+
+      {/* Main Container */}
+      <div className="flex flex-1 overflow-hidden" onClick={() => setShowDropdown(false)}>
+        {/* Left Area: Grid & Search */}
+        <div className="flex flex-1 flex-col p-3 overflow-hidden">
+          {/* Quick Add Search Input */}
+          <div className="relative mb-3 flex items-center gap-1">
+            <div className="relative flex-1">
+              <input
+                type="text"
+                value={productSearch}
+                onChange={(e) => { setProductSearch(e.target.value); setShowDropdown(true); }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && filteredProducts.length > 0) {
+                    e.preventDefault();
+                    handleAddProduct(filteredProducts[0]);
+                  }
+                }}
+                onFocus={() => setShowDropdown(true)}
+                onClick={(e) => e.stopPropagation()}
+                placeholder="Gõ vào mã/tên hàng hóa (Bấm Enter để chọn)"
+                className="h-9 w-full rounded border border-slate-300 bg-white px-3 pl-8 text-xs font-medium outline-none focus:border-teal-500"
+              />
+              <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+
+              {/* Dropdown search results - RIC Style Table Dropdown */}
+              {showDropdown && (
+                <div
+                  className="absolute left-0 right-0 top-full z-50 mt-1 max-h-72 overflow-y-auto rounded-md border border-slate-300 bg-white shadow-xl flex flex-col"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {/* Table Header for search dropddown */}
+                  <div className="flex bg-slate-100 border-b border-slate-300 px-3 py-2 text-[11px] font-bold text-slate-500 flex-shrink-0">
+                    <span className="w-1/2">MÃ/TÊN</span>
+                    <span className="w-1/4 text-center">GIÁ</span>
+                    <span className="w-1/4 text-center">TỒN</span>
+                  </div>
+
+                  {/* Table Body */}
+                  <div className="overflow-y-auto flex-1 max-h-56">
+                    {filteredProducts.length === 0 ? (
+                      <div className="p-3 text-center text-xs text-slate-400">Không tìm thấy hàng hóa</div>
+                    ) : (
+                      filteredProducts.map(p => {
+                        const matchBal = (p.stockBalances || []).find((b: any) => b.locationCode === locationCode);
+                        const systemQty = matchBal ? matchBal.totalPhysical : (p.totalPhysical ?? p.stockQty ?? 0);
+                        const price = p.price !== undefined ? p.price : 0;
+                        return (
+                          <div
+                            key={p.id}
+                            onClick={() => handleAddProduct(p)}
+                            className="flex items-center px-3 py-2 hover:bg-slate-100 cursor-pointer border-b border-slate-100 text-xs text-slate-700"
+                          >
+                            <div className="w-1/2 pr-2">
+                              <p className="font-bold text-slate-800">{p.internalSku}</p>
+                              <p className="text-[11px] text-slate-500 truncate">{p.name}</p>
+                            </div>
+                            <span className="w-1/4 text-center text-slate-600 font-semibold">{price.toLocaleString('vi-VN')}</span>
+                            <span className="w-1/4 text-center text-slate-600 font-bold">{systemQty.toFixed(1)}</span>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  {/* Dropdown Footer */}
+                  <div className="flex items-center justify-between border-t border-slate-200 px-3 py-1.5 bg-slate-50 text-[10px] text-slate-500 font-semibold flex-shrink-0">
+                    <span>Tìm thấy {filteredProducts.length} sản phẩm</span>
+                    <button
+                      type="button"
+                      onClick={() => setShowDropdown(false)}
+                      className="text-red-500 hover:text-red-700 font-bold"
+                    >
+                      ✕ Đóng
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Quick action buttons next to search - Small Barcode Scan button */}
+            <button
+              type="button"
+              onClick={() => setScannerOpen(true)}
+              className="flex h-9 w-9 items-center justify-center rounded border border-slate-300 bg-white text-slate-600 hover:bg-slate-50 transition"
+              title="Quét mã vạch sản phẩm"
+            >
+              <Camera className="h-4 w-4" />
+            </button>
+
+            <button type="button" className="flex h-9 w-9 items-center justify-center rounded border border-slate-300 bg-white text-slate-600 hover:bg-slate-50">
+              +
+            </button>
+            <button type="button" className="flex h-9 w-9 items-center justify-center rounded border border-slate-300 bg-white text-slate-600 hover:bg-slate-50">
+              <ListChecks className="h-4 w-4" />
+            </button>
+            <button type="button" className="flex h-9 w-9 items-center justify-center rounded border border-slate-300 bg-white text-slate-600 hover:bg-slate-50">
+              <RefreshCw className="h-4 w-4" />
+            </button>
+          </div>
+
+          {/* Dialog Barcode Scanner */}
+          <BarcodeScanner
+            isOpen={scannerOpen}
+            onClose={() => setScannerOpen(false)}
+            onProductFound={(product, qty) => {
+              // Thêm sản phẩm được quét vào danh sách kiểm kê của RIC
+              const existIdx = items.findIndex(
+                item => item.product.id === product.id || (product.internalSku && item.product.internalSku === product.internalSku)
+              );
+              if (existIdx >= 0) {
+                // Cộng dồn thực tồn
+                handleUpdateCounted(existIdx, items[existIdx].countedQty + qty);
+              } else {
+                // Thêm mới với tồn kho theo kho đang chọn
+                const matchBal = (product.stockBalances || []).find((b: any) => b.locationCode === locationCode);
+                const systemQty = matchBal ? matchBal.totalPhysical : ((product as any).totalPhysical ?? (product as any).stockQty ?? product.totalStock ?? 0);
+                setItems(prev => [
+                  ...prev,
+                  {
+                    product: { id: product.id, internalSku: product.internalSku, name: product.name, unit: product.unit || 'Cái', systemQty },
+                    countedQty: systemQty + qty,
+                    note: 'Quét từ Barcode'
+                  }
+                ]);
+              }
+              setScannerOpen(false);
+            }}
+            title="Quét mã vạch sản phẩm"
+          />
+
+          {/* Grid Headers & Items */}
+          <div className="flex-1 overflow-auto border border-slate-300 bg-white rounded">
+            <table className="w-full border-collapse text-left text-xs">
+              <thead>
+                <tr className="bg-slate-100 border-b border-slate-300 font-bold text-slate-700">
+                  <th className="w-10 border-r border-slate-300 px-2 py-2 text-center">No.</th>
+                  <th className="border-r border-slate-300 px-3 py-2 text-center">Mã</th>
+                  <th className="border-r border-slate-300 px-3 py-2">Tên</th>
+                  <th className="border-r border-slate-300 px-3 py-2 text-center bg-yellow-50">Số tồn</th>
+                  <th className="border-r border-slate-300 px-3 py-2 text-center bg-teal-50">Thực tồn</th>
+                  <th className="border-r border-slate-300 px-3 py-2 text-center bg-red-50">Lệch</th>
+                  <th className="w-16 px-2 py-2 text-center">Thao tác</th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.length === 0 ? (
+                  <tr>
+                    <td colSpan={7} className="px-6 py-20 text-center text-xs text-slate-400 italic">
+                      Chưa có hàng hóa nào được chọn. Vui lòng nhập tìm kiếm sản phẩm phía trên.
+                    </td>
+                  </tr>
+                ) : (
+                  items.map((item, idx) => {
+                    const systemVal = item.product.systemQty || 0;
+                    const diff = item.countedQty - systemVal;
+
+                    return (
+                      <tr key={item.product.id} className="border-b border-slate-200 hover:bg-slate-50/50">
+                        <td className="border-r border-slate-300 px-2 py-2 text-center text-slate-500 font-semibold">{idx + 1}.</td>
+                        <td className="border-r border-slate-300 px-3 py-2 text-center font-bold text-slate-700">{item.product.internalSku}</td>
+                        <td className="border-r border-slate-300 px-3 py-2 text-slate-600">{item.product.name}</td>
+                        <td className="border-r border-slate-300 px-3 py-2 text-center font-bold text-slate-700 bg-yellow-50/50">{systemVal}</td>
+                        <td className="border-r border-slate-300 px-2 py-1 text-center bg-teal-50/50">
+                          <input
+                            type="number"
+                            min="0"
+                            value={item.countedQty}
+                            onChange={(e) => handleUpdateCounted(idx, Number(e.target.value))}
+                            className="h-7 w-20 text-center rounded border border-slate-300 outline-none text-xs font-bold text-teal-800 focus:border-teal-500"
+                          />
+                        </td>
+                        <td className="border-r border-slate-300 px-3 py-2 text-center font-bold bg-red-50/50">
+                          <span className={diff > 0 ? 'text-emerald-600' : diff < 0 ? 'text-red-600' : 'text-slate-500'}>
+                            {diff > 0 ? `+${diff}` : diff}
+                          </span>
+                        </td>
+                        <td className="px-2 py-2 text-center">
+                          <div className="flex items-center justify-center gap-1.5">
+                            <button
+                              onClick={() => {
+                                // Clone item
+                                setItems(prev => [
+                                  ...prev,
+                                  { ...item, product: { ...item.product, id: item.product.id + '_clone_' + Date.now() } }
+                                ]);
+                              }}
+                              className="text-blue-500 hover:text-blue-700 transition"
+                              title="Nhân bản"
+                            >
+                              📋
+                            </button>
+                            <button
+                              onClick={() => handleRemoveItem(idx)}
+                              className="text-red-500 hover:text-red-700 font-bold transition"
+                              title="Xóa dòng"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Right Area: Form details */}
+        <div className="w-72 border-l border-slate-300 bg-slate-50 p-3 space-y-3.5 flex flex-col justify-between flex-shrink-0">
+          <div className="space-y-3">
+            {/* Mã HD */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">MÃ HĐ:</label>
+              <input
+                type="text"
+                readOnly
+                placeholder="Tạo tự động"
+                className="h-8 w-full rounded border border-slate-300 bg-slate-100 px-2 text-xs font-semibold outline-none"
+              />
+            </div>
+
+            {/* Ngày kiểm */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">NGÀY:</label>
+              <div className="relative">
+                <input
+                  type="date"
+                  value={plannedDate}
+                  onChange={(e) => setPlannedDate(e.target.value)}
+                  className="h-8 w-full rounded border border-slate-300 bg-white px-2 text-xs font-semibold outline-none"
+                />
+              </div>
+            </div>
+
+            {/* Kho kiểm */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">KHO KIỂM:</label>
+              <select
+                value={locationCode}
+                onChange={(e) => setLocationCode(e.target.value)}
+                className="h-8 w-full rounded border border-slate-300 bg-white px-2 text-xs font-semibold outline-none"
+              >
+                <option value="">— Chọn kho —</option>
+                {warehouses.map(w => (
+                  <option key={w.id} value={w.code}>{w.code} - {w.name}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Nhân viên */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">NHÂN VIÊN:</label>
+              {isStaff ? (
+                <input
+                  type="text"
+                  value={assignee}
+                  readOnly
+                  className="h-8 w-full rounded border border-slate-300 bg-slate-100 px-2 text-xs font-semibold outline-none text-slate-600"
+                />
+              ) : (
+                <select
+                  value={assignee}
+                  onChange={(e) => setAssignee(e.target.value)}
+                  className="h-8 w-full rounded border border-slate-300 bg-white px-2 text-xs font-semibold outline-none"
+                >
+                  <option value="">— Chọn nhân viên —</option>
+                  {users
+                    .filter(u => Array.isArray(u.roles) && u.roles.some((r: any) => ['staff', 'manager', 'admin'].includes(r.name?.toLowerCase())))
+                    .map(u => (
+                      <option key={u.id} value={u.fullName || u.email}>{u.fullName || u.email}</option>
+                    ))}
+                </select>
+              )}
+            </div>
+
+            {/* Ghi chú */}
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">GHI CHÚ:</label>
+              <textarea
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Ghi chú phiếu..."
+                rows={3}
+                className="w-full rounded border border-slate-300 bg-white px-2 py-1.5 text-xs font-medium outline-none resize-none"
+              />
+            </div>
+          </div>
+
+          {/* Form Statistics */}
+          <div className="bg-yellow-50 border border-yellow-200 rounded p-2.5 space-y-1 text-xs">
+            <div className="flex justify-between font-semibold">
+              <span className="text-slate-500">Tổng sản phẩm:</span>
+              <span className="text-slate-800">{items.length}</span>
+            </div>
+            <div className="flex justify-between font-semibold">
+              <span className="text-slate-500">Thực đếm:</span>
+              <span className="text-slate-800">
+                {items.reduce((sum, item) => sum + item.countedQty, 0)}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* RIC Footer Action Buttons */}
+      <div className="flex h-12 items-center justify-end gap-1.5 border-t border-slate-300 bg-slate-200 px-4 flex-shrink-0">
+        <button
+          onClick={() => executeSubmit(isManager ? 'COUNTING' : 'COUNTING_DONE')}
+          disabled={submitting || items.length === 0}
+          className="flex h-8 items-center gap-1 rounded bg-emerald-600 px-4 text-xs font-bold text-white shadow hover:bg-emerald-700 disabled:opacity-50 transition"
+        >
+          💾 Lưu
+        </button>
+        <button
+          onClick={() => { window.print(); }}
+          className="flex h-8 items-center gap-1 rounded bg-pink-600 px-4 text-xs font-bold text-white shadow hover:bg-pink-700 transition"
+        >
+          🖨 In
+        </button>
+        <button
+          onClick={async () => {
+            await executeSubmit(isManager ? 'COUNTING' : 'COUNTING_DONE');
+            window.print();
+          }}
+          disabled={submitting || items.length === 0}
+          className="flex h-8 items-center gap-1 rounded bg-blue-600 px-4 text-xs font-bold text-white shadow hover:bg-blue-700 disabled:opacity-50 transition"
+        >
+          💾 In & Lưu
+        </button>
+        <button
+          onClick={() => executeSubmit('DRAFT')}
+          disabled={submitting}
+          className="flex h-8 items-center gap-1 rounded bg-amber-500 px-4 text-xs font-bold text-white shadow hover:bg-amber-600 disabled:opacity-50 transition"
+        >
+          💾 Lưu tạm
+        </button>
+        <button
+          onClick={onClose}
+          className="flex h-8 items-center gap-1 rounded bg-red-600 px-4 text-xs font-bold text-white shadow hover:bg-red-700 transition"
+        >
+          ✕ Đóng
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── DETAIL MODAL ──────────────────────────────────────────────
+
+function StocktakeDetailModal({
+  stocktake,
+  onClose,
+  onRefresh,
+  onApproveClick,
+  onSuccess,
+  onError,
+  isManager = false,
+  isStaff = false,
+}: {
+  stocktake: StocktakeItem;
+  onClose: () => void;
+  onRefresh: () => void;
+  onApproveClick?: (st: StocktakeItem) => void;
+  onSuccess: (msg: string) => void;
+  onError: (msg: string) => void;
+  isManager?: boolean;
+  isStaff?: boolean;
+}) {
+  const [products, setProducts] = React.useState<ProductOption[]>([]);
+  const [editCounts, setEditCounts] = React.useState<Record<string, string>>({});
+  const [note, setNote] = React.useState(stocktake.note || '');
+  const [isEditing, setIsEditing] = React.useState(false);
+  const [submitting, setSubmitting] = React.useState(false);
+
+  React.useEffect(() => {
+    setNote(stocktake.note || '');
+  }, [stocktake]);
+
+  React.useEffect(() => {
+    fetch(`${API_BASE}/products`, { headers: authHeaders() })
+      .then((r) => r.json())
+      .then((data) => {
+        if (Array.isArray(data)) setProducts(data);
+        else if (data?.data && Array.isArray(data.data)) setProducts(data.data);
+      })
+      .catch(() => { });
+  }, []);
+
+  const detailsList = Array.isArray(stocktake?.details) ? stocktake.details : [];
+  const totalTon = detailsList.reduce((sum, d) => sum + (d.systemQty || 0), 0);
+  const totalThucTon = detailsList.reduce((sum, d) => sum + (d.countedQty || 0), 0);
+  const totalLech = detailsList.reduce((sum, d) => sum + (d.difference || 0), 0);
+
+  const [selectedProductId, setSelectedProductId] = React.useState('');
+
+  const handleAddProductToExisting = async () => {
+    if (!selectedProductId) return;
+    try {
+      const res = await fetch(`${API_BASE}/inventory/stocktakes/${stocktake.id}/details`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ productId: selectedProductId }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.message || 'Không thể thêm sản phẩm');
+      }
+      setSelectedProductId('');
+      onSuccess('Đã thêm sản phẩm vào phiếu kiểm kê');
+      onRefresh();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Lỗi');
+    }
+  };
+
+  const handleSaveAll = async () => {
+    setSubmitting(true);
+    try {
+      if (note !== stocktake.note) {
+        await fetch(`${API_BASE}/inventory/stocktakes/${stocktake.id}`, {
+          method: 'PATCH',
+          headers: authHeaders(),
+          body: JSON.stringify({ note }),
+        });
+      }
+      for (const d of detailsList) {
+        const val = editCounts[d.id];
+        if (val !== undefined && val !== '') {
+          const qty = parseInt(val, 10);
+          if (!isNaN(qty) && qty >= 0) {
+            const res = await fetch(`${API_BASE}/inventory/stocktakes/details/${d.id}/count`, {
+              method: 'PATCH',
+              headers: authHeaders(),
+              body: JSON.stringify({ countedQty: qty }),
+            });
+            if (!res.ok) {
+              const errData = await res.json().catch(() => null);
+              throw new Error(errData?.message || 'Không thể cập nhật số lượng đếm');
+            }
+          }
+        }
+      }
+      onSuccess('Đã lưu thay đổi phiếu kiểm kê');
+      setIsEditing(false);
+      onRefresh();
+    } catch (err) {
+      onError('Lỗi khi lưu: ' + (err instanceof Error ? err.message : ''));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleApprove = async () => {
+    try {
+      const user = JSON.parse(localStorage.getItem('user') || '{}');
+      const res = await fetch(`${API_BASE}/inventory/stocktakes/${stocktake.id}/approve`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ approvedBy: user.fullName || user.email || '' }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.message || 'Không thể duyệt');
+      }
+      onSuccess('Đã duyệt và cập nhật tồn kho');
+      onRefresh();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : 'Lỗi');
+    }
+  };
+
+  const canApprove = (stocktake.status === 'COUNTING_DONE' || stocktake.status === 'COUNTING' || stocktake.status === 'DRAFT') && isManager;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 backdrop-blur-xs" onClick={onClose}>
+      <div
+        className="w-full max-w-4xl max-h-[85vh] flex flex-col rounded-lg bg-white shadow-2xl border border-slate-300 overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Title Bar */}
+        <div className="flex h-10 items-center justify-between bg-slate-100 border-b border-slate-300 px-4 flex-shrink-0">
+          <span className="text-xs font-bold text-slate-700 uppercase tracking-wider">THÔNG TIN PHIẾU KIỂM KÊ</span>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-700 text-sm font-bold">✕</button>
+        </div>
+
+        {/* Info Header */}
+        <div className="p-4 border-b border-slate-200 bg-slate-50/50 flex-shrink-0 space-y-2 text-xs text-slate-700">
+          <div className="flex items-center justify-between flex-wrap gap-4">
+            <div className="flex items-center gap-8">
+              <div>
+                <span className="font-semibold text-slate-500">Ngày:</span>{' '}
+                <span className="font-bold text-slate-800">
+                  {stocktake.plannedDate ? new Date(stocktake.plannedDate).toLocaleDateString('vi-VN') : new Date(stocktake.createdAt).toLocaleDateString('vi-VN')}
+                </span>
+              </div>
+              <div>
+                <span className="font-semibold text-slate-500">Mã phiếu:</span>{' '}
+                <span className="font-bold text-teal-700">{stocktake.stocktakeNo}</span>
+              </div>
+              <div>
+                <span className="font-semibold text-slate-500">Kho kiểm:</span>{' '}
+                <span className="font-bold text-slate-800">{stocktake.locationCode || '—'}</span>
+              </div>
+            </div>
+            <div>
+              <span className="font-semibold text-slate-500">Trạng thái:</span>{' '}
+              <StatusBadge status={stocktake.status} />
+            </div>
+          </div>
+          <div className="flex items-center justify-between flex-wrap gap-4 pt-1.5 border-t border-slate-200/60">
+            <div>
+              <span className="font-semibold text-slate-500">Nhân viên:</span>{' '}
+              <span className="font-bold text-slate-800">{stocktake.assignee || stocktake.createdBy || '—'}</span>
+            </div>
+            {isEditing ? (
+              <div className="flex items-center gap-2 bg-amber-50 border border-amber-300 rounded px-2.5 py-1 text-xs flex-1 max-w-md ml-auto">
+                <span className="font-bold text-amber-900 flex-shrink-0">Ghi chú phiếu:</span>
+                <input
+                  type="text"
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="Ghi chú phiếu..."
+                  className="h-6 w-full rounded border border-amber-300 bg-white px-2 text-xs text-slate-700 outline-none focus:border-amber-500 font-medium"
+                />
+              </div>
+            ) : (
+              note && (
+                <div className="bg-amber-50 border border-amber-200 rounded px-2.5 py-1 text-amber-800 font-semibold text-xs">
+                  <span className="font-bold text-slate-500">Ghi chú phiếu:</span> {note}
+                </div>
+              )
+            )}
+          </div>
+        </div>
+
+        {/* Edit mode: Add product bar */}
+        {isEditing && (
+          <div className="flex items-center gap-2 px-4 pt-3 text-xs flex-shrink-0">
+            {(() => {
+              const existingProductIds = new Set(detailsList.map(d => d.product?.id).filter(Boolean));
+              const availableProducts = products.filter(p => !existingProductIds.has(p.id));
+              return (
+                <select
+                  value={selectedProductId}
+                  onChange={(e) => setSelectedProductId(e.target.value)}
+                  className="h-8 flex-1 rounded border border-slate-300 bg-white px-2 outline-none"
+                >
+                  <option value="">— Chọn sản phẩm để thêm vào phiếu —</option>
+                  {availableProducts.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.internalSku} - {p.name} {p.unit ? `(${p.unit})` : ''}
+                    </option>
+                  ))}
+                </select>
+              );
+            })()}
+            <button
+              type="button"
+              onClick={handleAddProductToExisting}
+              disabled={!selectedProductId}
+              className="h-8 rounded bg-teal-600 px-3 font-bold text-white hover:bg-teal-700 disabled:opacity-50"
+            >
+              + Thêm sản phẩm
+            </button>
+          </div>
+        )}
+
+        {/* Table Details */}
+        <div className="flex-1 overflow-auto p-4">
+          <table className="w-full border-collapse text-left text-xs">
+            <thead>
+              <tr className="bg-slate-100 border border-slate-300 font-bold text-slate-700">
+                <th className="w-10 border border-slate-300 px-2 py-2 text-center">TT</th>
+                <th className="border border-slate-300 px-3 py-2 text-center">Mã hàng</th>
+                <th className="border border-slate-300 px-3 py-2">Tên</th>
+                <th className="border border-slate-300 px-3 py-2 text-center">ĐV</th>
+                <th className="border border-slate-300 px-3 py-2 text-center bg-yellow-50/40">Số tồn</th>
+                <th className="border border-slate-300 px-3 py-2 text-center bg-teal-50/40">Thực tồn</th>
+                <th className="border border-slate-300 px-3 py-2 text-center bg-red-50/40">Lệch</th>
+                {stocktake.status !== 'APPROVED' && stocktake.status !== 'REJECTED' && (
+                  <th className="w-10 border border-slate-300 px-1 py-2 text-center text-red-500">Xóa</th>
+                )}
+              </tr>
+            </thead>
+            <tbody>
+              {detailsList.length === 0 ? (
+                <tr>
+                  <td colSpan={stocktake.status !== 'APPROVED' && stocktake.status !== 'REJECTED' ? 8 : 7} className="px-6 py-10 text-center text-xs text-slate-400 italic">
+                    Không có sản phẩm nào trong phiếu kiểm kê này.
+                  </td>
+                </tr>
+              ) : (
+                detailsList.map((d, idx) => {
+                  const isEditingThis = isEditing;
+                  const displayQty = isEditingThis
+                    ? (editCounts[d.id] !== undefined ? editCounts[d.id] : String(d.countedQty || 0))
+                    : (d.countedQty !== null ? d.countedQty : 0);
+                  const systemVal = d.systemQty || 0;
+                  const currentCount = Number(displayQty) || 0;
+                  const diff = currentCount - systemVal;
+
+                  return (
+                    <tr key={d.id} className="border-b border-slate-200 hover:bg-slate-50/30">
+                      <td className="border border-slate-300 px-2 py-2 text-center text-slate-500 font-semibold">{idx + 1}</td>
+                      <td className="border border-slate-300 px-3 py-2 text-center font-bold text-slate-700">{d.product?.internalSku || '—'}</td>
+                      <td className="border border-slate-300 px-3 py-2 text-slate-600">{d.product?.name || '—'}</td>
+                      <td className="border border-slate-300 px-3 py-2 text-center text-slate-500">{d.product?.unit || 'Cái'}</td>
+                      <td className="border border-slate-300 px-3 py-2 text-center font-bold text-slate-700 bg-yellow-50/20">{systemVal}</td>
+                      <td className="border border-slate-300 px-2 py-1 text-center bg-teal-50/20">
+                        {isEditingThis ? (
+                          <input
+                            type="number"
+                            min="0"
+                            value={displayQty}
+                            onChange={(e) => setEditCounts(prev => ({ ...prev, [d.id]: e.target.value }))}
+                            className="h-7 w-20 text-center rounded border border-slate-300 outline-none text-xs font-bold text-teal-800 focus:border-teal-500"
+                          />
+                        ) : (
+                          <span className="font-bold text-teal-700">{d.countedQty !== null ? d.countedQty : '—'}</span>
+                        )}
+                      </td>
+                      <td className="border border-slate-300 px-3 py-2 text-center font-bold bg-red-50/20">
+                        <span className={diff > 0 ? 'text-emerald-600' : diff < 0 ? 'text-red-600' : 'text-slate-500'}>
+                          {diff > 0 ? `+${diff}` : diff}
+                        </span>
+                      </td>
+                      {stocktake.status !== 'APPROVED' && stocktake.status !== 'REJECTED' && (
+                        <td className="border border-slate-300 px-1 py-1 text-center">
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              if (!window.confirm(`Bạn có chắc muốn xóa sản phẩm "${d.product?.name || d.product?.internalSku || ''}" khỏi phiếu kiểm kê này?`)) return;
+                              try {
+                                const res = await fetch(`${API_BASE}/inventory/stocktakes/details/${d.id}`, {
+                                  method: 'DELETE',
+                                  headers: authHeaders(),
+                                });
+                                if (!res.ok) {
+                                  const data = await res.json().catch(() => null);
+                                  throw new Error(data?.message || 'Không thể xóa sản phẩm');
+                                }
+                                onSuccess('Đã xóa sản phẩm khỏi phiếu kiểm kê');
+                                onRefresh();
+                              } catch (err: any) {
+                                onError(err.message || 'Lỗi khi xóa');
+                              }
+                            }}
+                            className="rounded p-1 text-red-500 transition hover:bg-red-50 hover:text-red-700"
+                            title="Xóa sản phẩm khỏi phiếu"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })
+              )}
+              {/* Row Total */}
+              {detailsList.length > 0 && (
+                <tr className="bg-slate-100 font-bold text-slate-700 border border-slate-300">
+                  <td colSpan={4} className="border border-slate-300 px-3 py-2 text-right">Tổng:</td>
+                  <td className="border border-slate-300 px-3 py-2 text-center">{totalTon}</td>
+                  <td className="border border-slate-300 px-3 py-2 text-center text-teal-700">{totalThucTon}</td>
+                  <td className="border border-slate-300 px-3 py-2 text-center">
+                    <span className={totalLech > 0 ? 'text-emerald-600' : totalLech < 0 ? 'text-red-600' : 'text-slate-500'}>
+                      {totalLech > 0 ? `+${totalLech}` : totalLech}
+                    </span>
+                  </td>
+                  {stocktake.status !== 'APPROVED' && stocktake.status !== 'REJECTED' && (
+                    <td className="border border-slate-300 px-3 py-2"></td>
+                  )}
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Footer actions */}
+        <div className="flex h-12 items-center justify-start gap-1.5 border-t border-slate-300 bg-slate-200 px-4 flex-shrink-0">
+          {isEditing ? (
+            <button
+              onClick={handleSaveAll}
+              disabled={submitting}
+              className="flex h-8 items-center gap-1 rounded bg-emerald-600 px-4 text-xs font-bold text-white shadow hover:bg-emerald-700 transition"
+            >
+              💾 Lưu thay đổi
+            </button>
+          ) : (
+            <button
+              onClick={() => setIsEditing(true)}
+              className="flex h-8 items-center gap-1 rounded bg-emerald-600 px-4 text-xs font-bold text-white shadow hover:bg-emerald-700 transition"
+            >
+              📝 Mở =&gt; Sửa
+            </button>
+          )}
+
+          {canApprove && (
+            <button
+              onClick={() => {
+                if (onApproveClick) {
+                  onApproveClick(stocktake);
+                } else {
+                  handleApprove();
+                }
+              }}
+              className="flex h-8 items-center gap-1 rounded bg-orange-500 px-4 text-xs font-bold text-white shadow hover:bg-orange-600 transition cursor-pointer"
+            >
+              🛡 DUYỆT PHIẾU
+            </button>
+          )}
+
+          <button
+            onClick={() => {
+              // Export CSV
+              const header = ['TT', 'Mã hàng', 'Tên', 'ĐV', 'Số tồn', 'Thực tồn', 'Lệch', 'Ghi chú'];
+              const rows = stocktake.details.map((d, i) => [
+                i + 1,
+                d.product?.internalSku || '',
+                d.product?.name || '',
+                d.product?.unit || 'Cái',
+                d.systemQty,
+                d.countedQty !== null ? d.countedQty : '',
+                d.difference,
+                d.note || ''
+              ]);
+              const csv = [header, ...rows].map(r => r.join(',')).join('\n');
+              const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url; a.download = `chi_tiet_kiem_ke_${stocktake.stocktakeNo}.csv`; a.click();
+              URL.revokeObjectURL(url);
+            }}
+            className="flex h-8 items-center gap-1 rounded bg-blue-600 px-4 text-xs font-bold text-white shadow hover:bg-blue-700 transition"
+          >
+            📊 Excel
+          </button>
+          <button
+            onClick={() => window.print()}
+            className="flex h-8 items-center gap-1 rounded bg-pink-600 px-4 text-xs font-bold text-white shadow hover:bg-pink-700 transition"
+          >
+            🖨 Print
+          </button>
+          <button
+            onClick={onClose}
+            className="flex h-8 items-center gap-1 rounded bg-red-600 px-4 text-xs font-bold text-white shadow hover:bg-red-700 transition"
+          >
+            ✕ Đóng
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
