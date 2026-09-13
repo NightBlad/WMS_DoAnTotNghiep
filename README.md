@@ -111,7 +111,7 @@ Một ô kệ an toàn không chỉ phụ thuộc vào việc "có nhét vừa h
 1. **Số lượng giới hạn theo thể tích**: Áp dụng chiết khấu hệ số xếp hàng thực tế $\eta_{\text{packing}} = 70\%$ dựa trên thể tích khả dụng của ô kệ và thể tích kiện hàng:
    $$N_{\text{volume}} = \left\lfloor \frac{V_{\text{available}}}{V_{\text{item}}} \times 0.70 \right\rfloor$$
 2. **Số lượng giới hạn theo tải trọng kệ**:
-   $$N_{\text{weight}} = \left\lfloor \frac{W_{\text{bin\_max}} - W_{\text{current}}}{m_{\text{item}}} \right\rfloor$$
+   $$N_{\text{weight}} = \left\lfloor \frac{W_{\text{bin,max}} - W_{\text{current}}}{m_{\text{item}}} \right\rfloor$$
 3. **Số lượng xếp tối đa an toàn**:
    $$N_{\text{max}} = \min(N_{\text{volume}}, N_{\text{weight}})$$
 4. **Cảnh báo Yếu tố giới hạn (`LimitingFactor`)**: Hệ thống tự động gắn nhãn cảnh báo thủ kho biết ô này đang bị kịch tải do **"Khối lượng (Weight)"** hay do **"Thể tích (Volume)"**, hỗ trợ việc ra quyết định chính xác 100%.
