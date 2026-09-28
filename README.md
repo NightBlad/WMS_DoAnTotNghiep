@@ -358,5 +358,6 @@ Hệ thống **Smart WMS** được phát triển và vận hành dựa trên ki
 5. 📂 **[Xem tệp điều hướng License tổng hợp tại thư mục gốc: LICENSE.md](LICENSE.md)** hoặc tệp chuẩn [LICENSE](LICENSE).
 
 ---
+Github gốc có sự đóng góp của tôi: https://github.com/tvloc02/quanlykhohang
 
 *Tài liệu giới thiệu sản phẩm & đặc tả kỹ thuật Smart WMS. Bản quyền thuộc về đội ngũ phát triển Smart WMS Solution.*
